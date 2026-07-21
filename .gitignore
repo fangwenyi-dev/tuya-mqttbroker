@@ -1,0 +1,33 @@
+# 涂鸦授权信息（包含 UUID/AuthKey，严禁提交）
+src/tuya_config_secrets.h
+
+# 构建产物
+build/
+*.o
+*.obj
+*.elf
+*.bin
+*.map
+*.a
+*.lib
+
+# IDE / 编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.clangd
+.cache/
+
+# TuyaOpen 构建缓存
+.cache/
+.dep/
+
+# 组件目录（mosquitto 等第三方组件，用户自行集成）
+components/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+desktop.ini
