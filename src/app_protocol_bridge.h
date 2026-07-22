@@ -127,6 +127,22 @@ void app_protocol_bridge_send_wind_lock(const char *device_sn, uint8_t mode);
  */
 void app_protocol_bridge_reset_tuya(void);
 
+/**
+ * @brief 发布 $SYS 系统监控主题
+ *
+ * 通过本地 MQTT 客户端发布系统状态信息到 $SYS 主题，
+ * 供远程监控使用。包括：运行时间、可用内存、设备数量、网关数量。
+ * 由系统监控 task 定期调用（建议每 30 秒）。
+ */
+void app_protocol_bridge_publish_sys_stats(void);
+
+/**
+ * @brief 获取在线网关数量
+ *
+ * @return 在线网关数量
+ */
+int app_protocol_bridge_get_online_gateway_count(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -52,7 +52,7 @@ static bool s_initialized = false;
 static void led_physical_set(bool on)
 {
     if (s_gpio_num < 0) return;
-    tkl_gpio_write(s_gpio_num, on ? TUYA_GPIO_LEVEL_LOW : TUYA_GPIO_LEVEL_HIGH);
+    tkl_gpio_write((TUYA_GPIO_NUM_E)s_gpio_num, on ? TUYA_GPIO_LEVEL_LOW : TUYA_GPIO_LEVEL_HIGH);
 }
 
 /**
@@ -109,7 +109,7 @@ static void led_task(void *arg)
     PR_INFO("LED 刷新 task 已启动: GPIO=%d", s_gpio_num);
 
     while (s_led_running) {
-        uint32_t now = tal_system_gettick();
+        uint32_t now = (uint32_t)tal_system_get_millisecond();
 
         tal_mutex_lock(s_led_mutex);
 
@@ -155,10 +155,11 @@ int app_led_init(int gpio_num)
 
     /* 配置 GPIO 为输出模式 */
     TUYA_GPIO_BASE_CFG_T gpio_cfg = {
-        .mode = TUYA_GPIO_MODE_OUTPUT,
-        .pull = TUYA_GPIO_FLOATING,
+        .direct = TUYA_GPIO_OUTPUT,
+        .mode   = TUYA_GPIO_PUSH_PULL,
+        .level  = TUYA_GPIO_LEVEL_HIGH,  /* 初始关闭（低电平有效） */
     };
-    int rt = tkl_gpio_init(s_gpio_num, gpio_cfg);
+    int rt = tkl_gpio_init((TUYA_GPIO_NUM_E)s_gpio_num, &gpio_cfg);
     if (rt != 0) {
         PR_ERR("LED GPIO %d 初始化失败: %d", gpio_num, rt);
         return -1;
@@ -203,7 +204,7 @@ void app_led_set(led_color_t color, led_mode_t mode, uint32_t duration_ms)
     tal_mutex_lock(s_led_mutex);
     s_leds[color].mode = mode;
     s_leds[color].duration_ms = duration_ms;
-    s_leds[color].start_time_ms = tal_system_gettick();
+    s_leds[color].start_time_ms = (uint32_t)tal_system_get_millisecond();
     s_leds[color].valid = true;
     tal_mutex_unlock(s_led_mutex);
 }
@@ -233,7 +234,7 @@ void app_led_flash(led_color_t color)
 
     s_leds[color].mode = LED_MODE_FLASH;
     s_leds[color].duration_ms = 0;
-    s_leds[color].start_time_ms = tal_system_gettick();
+    s_leds[color].start_time_ms = (uint32_t)tal_system_get_millisecond();
     s_leds[color].valid = true;
 
     tal_mutex_unlock(s_led_mutex);

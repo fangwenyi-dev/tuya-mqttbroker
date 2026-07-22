@@ -31,6 +31,7 @@
 #include "cJSON.h"
 #include "netmgr.h"
 #include "tal_api.h"
+#include "tal_memory.h"
 #include "tkl_output.h"
 #include "tuya_config.h"
 #include "tuya_iot.h"
@@ -80,6 +81,32 @@ static volatile bool s_monitor_running = false;
 
 /* WiFi 连接状态 */
 static volatile bool s_wifi_connected = false;
+
+/* ==================== KV Seed/Key 派生 ==================== */
+
+/**
+ * @brief 从 MAC 地址派生 KV 加密 seed 和 key
+ *
+ * 原方案使用硬编码 seed/key，所有设备相同，存在安全隐患。
+ * 改为从设备唯一 MAC 地址派生，确保每台设备 KV 加密密钥不同。
+ * 注意：更改 seed/key 后，已有 KV 数据将无法读取（需重新配网）。*/
+static void derive_kv_from_mac(const NW_MAC_S *mac, char *seed, char *key, size_t buf_size)
+{
+    if (mac == NULL || seed == NULL || key == NULL || buf_size < 17) return;
+
+    uint8_t m[6];
+    memcpy(m, mac->mac, 6);
+
+    /* seed: "ty" + MAC 正序 hex + XOR校验 = 2 + 14 = 16 字符 */
+    uint8_t xor_all = m[0] ^ m[1] ^ m[2] ^ m[3] ^ m[4] ^ m[5];
+    snprintf(seed, buf_size, "ty%02X%02X%02X%02X%02X%02X%02X",
+             m[0], m[1], m[2], m[3], m[4], m[5], xor_all);
+
+    /* key: "br" + MAC 逆序 hex + 异或校验 = 2 + 14 = 16 字符 */
+    uint8_t xor_tail = m[2] ^ m[3] ^ m[4] ^ m[5];
+    snprintf(key, buf_size, "br%02X%02X%02X%02X%02X%02X%02X",
+             m[5], m[4], m[3], m[2], m[1], m[0], xor_tail);
+}
 
 /* ==================== 用户日志输出回调 ==================== */
 
@@ -142,6 +169,13 @@ void user_event_handler_on(tuya_iot_client_t *client, tuya_event_msg_t *event)
         app_protocol_bridge_on_wifi_connected();
         break;
 
+    case TUYA_EVENT_MQTT_DISCONNECT:
+        PR_WARN("涂鸦云连接断开");
+        s_wifi_connected = false;
+        /* 蓝灯慢闪：等待重连 */
+        app_led_set(LED_BLUE, LED_MODE_SLOW_BLINK, 0);
+        break;
+
     case TUYA_EVENT_DP_RECEIVE_OBJ: {
         /* 收到 DP 下发命令（App → 设备） */
         dp_obj_recv_t *dpobj = event->value.dpobj;
@@ -199,21 +233,40 @@ static void system_monitor_task(void *arg)
     PR_INFO("系统监控 task 已启动");
 
     uint32_t last_check = 0;
+    uint32_t last_sys_publish = 0;
+    uint32_t last_heap_check = 0;
+    uint32_t boot_time = (uint32_t)tal_system_get_millisecond();
 
     while (s_monitor_running) {
-        uint32_t now = tal_system_gettick();
+        uint32_t now = (uint32_t)tal_system_get_millisecond();
 
         /* 每 60 秒检查一次网关离线状态 */
         if ((now - last_check) >= 60000) {
             last_check = now;
             app_protocol_bridge_check_gateway_offline();
 
-            /* 打印设备数量 */
+            /* 打印设备数量和内存状态 */
             int dev_count = app_tuya_bridge_device_count();
-            PR_DEBUG("系统监控: 已注册设备=%d, WiFi=%s, 云连接=%s",
-                     dev_count,
-                     s_wifi_connected ? "已连接" : "未连接",
+            int free_heap = tal_system_get_free_heap_size();
+            uint32_t uptime_s = (now - boot_time) / 1000;
+            PR_DEBUG("系统监控: uptime=%lus 设备=%d 内存=%dB 云连接=%s",
+                     (unsigned long)uptime_s, dev_count, free_heap,
                      s_wifi_connected ? "已连接" : "未连接");
+        }
+
+        /* 每 30 秒发布 $SYS 监控主题 */
+        if ((now - last_sys_publish) >= 30000) {
+            last_sys_publish = now;
+            app_protocol_bridge_publish_sys_stats();
+        }
+
+        /* 每 10 秒检查内存，低于阈值时告警 */
+        if ((now - last_heap_check) >= 10000) {
+            last_heap_check = now;
+            int free_heap = tal_system_get_free_heap_size();
+            if (free_heap < 1024 * 10) {
+                PR_ERR("⚠ 可用内存过低: %d bytes (< 10KB)，存在 OOM 风险", free_heap);
+            }
         }
 
         /* WiFi 断开时蓝灯慢闪 */
@@ -254,9 +307,21 @@ void user_main(void)
     PR_NOTICE("========================================");
 
     /* 2. TAL 模块初始化 */
+    /* 从 MAC 地址派生唯一的 KV seed/key（避免所有设备使用相同密钥）*/
+    NW_MAC_S kv_mac = {0};
+    char kv_seed[17] = {0};
+    char kv_key[17]  = {0};
+    if (tkl_wifi_get_mac(WF_STATION, &kv_mac) == OPRT_OK) {
+        derive_kv_from_mac(&kv_mac, kv_seed, kv_key, sizeof(kv_seed));
+    } else {
+        PR_WARN("获取 MAC 失败，KV 使用回退密钥（不推荐）");
+        strncpy(kv_seed, "vmlkasdh93dlvlcy", sizeof(kv_seed) - 1);
+        strncpy(kv_key,  "dflfuap134ddlduq", sizeof(kv_key) - 1);
+    }
+    PR_INFO("KV seed/key 已从 MAC 地址派生");
     tal_kv_init(&(tal_kv_cfg_t){
-        .seed = "vmlkasdh93dlvlcy",
-        .key  = "dflfuap134ddlduq",
+        .seed = kv_seed,
+        .key  = kv_key,
     });
     tal_sw_timer_init();
     tal_workq_init();

@@ -7,7 +7,7 @@
  * 相比 Matter 版本的变化：
  * - 移除 5击重置 Matter（TuyaOpen 无 Matter 概念）
  * - 长按改为调用 app_protocol_bridge_reset_tuya() 重置涂鸦配网
- * - 使用 TAL API（tal_system_gettick, tal_thread_create）替代 ESP-IDF API
+ * - 使用 TAL API（tal_system_get_millisecond, tal_thread_create）替代 ESP-IDF API
  */
 
 #include "app_button.h"
@@ -47,10 +47,10 @@ static void button_task(void *arg)
     while (s_button_running) {
         /* 读取 GPIO 电平（低电平=按下） */
         TUYA_GPIO_LEVEL_E level = TUYA_GPIO_LEVEL_HIGH;
-        tkl_gpio_read(s_gpio_num, &level);
+        tkl_gpio_read((TUYA_GPIO_NUM_E)s_gpio_num, &level);
 
         bool pressed = (level == TUYA_GPIO_LEVEL_LOW);
-        uint32_t now = tal_system_gettick();
+        uint32_t now = (uint32_t)tal_system_get_millisecond();
 
         if (pressed && !last_pressed) {
             /* 按下边沿（消抖） */
@@ -78,18 +78,15 @@ static void button_task(void *arg)
             switch (click_count) {
             case 2:
                 PR_INFO("2击 → 启动 LoRa 配对模式");
-                app_led_set(LED_GREEN, LED_MODE_FAST_BLINK, 0);
+                /* 使用 LED duration 自动熄灭，避免阻塞按键检测 task */
+                app_led_set(LED_GREEN, LED_MODE_FAST_BLINK, 3000);
                 app_protocol_bridge_start_pairing();
-                /* 3 秒后恢复绿灯状态 */
-                tal_system_sleep(3000);
-                app_led_off(LED_GREEN);
                 break;
             case 3:
                 PR_INFO("3击 → 删除所有 LoRa 子设备");
-                app_led_set(LED_RED, LED_MODE_FAST_BLINK, 0);
+                /* 删除操作可能耗时（等待网关响应），LED 使用 5s duration */
+                app_led_set(LED_RED, LED_MODE_FAST_BLINK, 5000);
                 app_protocol_bridge_delete_all_devices();
-                tal_system_sleep(1000);
-                app_led_off(LED_RED);
                 break;
             default:
                 PR_DEBUG("点击 %d 次（无绑定操作）", click_count);
@@ -118,10 +115,11 @@ int app_button_init(int gpio_num)
 
     /* 配置 GPIO 为输入模式（上拉） */
     TUYA_GPIO_BASE_CFG_T gpio_cfg = {
-        .mode = TUYA_GPIO_MODE_INPUT,
-        .pull = TUYA_GPIO_PULLUP,
+        .direct = TUYA_GPIO_INPUT,
+        .mode   = TUYA_GPIO_PULLUP,
+        .level  = TUYA_GPIO_LEVEL_LOW,
     };
-    int rt = tkl_gpio_init(s_gpio_num, gpio_cfg);
+    int rt = tkl_gpio_init((TUYA_GPIO_NUM_E)s_gpio_num, &gpio_cfg);
     if (rt != 0) {
         PR_ERR("GPIO %d 初始化失败: %d", gpio_num, rt);
         return -1;

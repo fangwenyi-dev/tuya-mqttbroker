@@ -38,6 +38,10 @@ static tuya_iot_client_t  *s_client = NULL;
 /** 映射表访问互斥锁（DP 接收在 yield 线程，状态上报在 bridge task） */
 static MUTEX_HANDLE       s_map_mutex = NULL;
 
+/* DP 上报重试参数 */
+#define DP_REPORT_RETRY_COUNT   2
+#define DP_REPORT_RETRY_DELAY  150  /* ms */
+
 /* ==================== 内部辅助函数 ==================== */
 
 /**
@@ -73,9 +77,17 @@ static void report_dp_value(uint8_t dp_id, int32_t value)
     dp.value.dp_value = value;
     dp.time_stamp = tal_time_get_posix();
 
-    int rt = tuya_iot_dp_obj_report(s_client, NULL, &dp, 1, 0);
+    int rt = OPRT_COM_ERROR;
+    for (int retry = 0; retry <= DP_REPORT_RETRY_COUNT; retry++) {
+        rt = tuya_iot_dp_obj_report(s_client, NULL, &dp, 1, 0);
+        if (rt == OPRT_OK) break;
+        if (retry < DP_REPORT_RETRY_COUNT) {
+            PR_WARN("DP %d 上报失败 (retry %d/%d): %d", dp_id, retry + 1, DP_REPORT_RETRY_COUNT, rt);
+            tal_system_sleep(DP_REPORT_RETRY_DELAY);
+        }
+    }
     if (rt != OPRT_OK) {
-        PR_ERR("DP %d 上报失败: %d", dp_id, rt);
+        PR_ERR("DP %d 上报最终失败: %d", dp_id, rt);
     } else {
         PR_DEBUG("DP %d 上报成功: value=%d", dp_id, value);
     }
@@ -97,9 +109,17 @@ static void report_dp_enum(uint8_t dp_id, uint32_t value)
     dp.value.dp_enum = value;
     dp.time_stamp = tal_time_get_posix();
 
-    int rt = tuya_iot_dp_obj_report(s_client, NULL, &dp, 1, 0);
+    int rt = OPRT_COM_ERROR;
+    for (int retry = 0; retry <= DP_REPORT_RETRY_COUNT; retry++) {
+        rt = tuya_iot_dp_obj_report(s_client, NULL, &dp, 1, 0);
+        if (rt == OPRT_OK) break;
+        if (retry < DP_REPORT_RETRY_COUNT) {
+            PR_WARN("DP %d 上报失败 (retry %d/%d): %d", dp_id, retry + 1, DP_REPORT_RETRY_COUNT, rt);
+            tal_system_sleep(DP_REPORT_RETRY_DELAY);
+        }
+    }
     if (rt != OPRT_OK) {
-        PR_ERR("DP %d 上报失败: %d", dp_id, rt);
+        PR_ERR("DP %d 上报最终失败: %d", dp_id, rt);
     } else {
         PR_DEBUG("DP %d 上报成功: enum=%u", dp_id, value);
     }
@@ -114,10 +134,8 @@ static void report_dp_enum(uint8_t dp_id, uint32_t value)
  * @param device_index 设备索引
  * @param value 控制枚举值（0=停止, 1=打开, 2=关闭, 3=内倒）
  */
-static void handle_control_dp(int device_index, uint32_t value)
+static void handle_control_dp(const char *sn, uint32_t value)
 {
-    const char *sn = s_devices[device_index].device_sn;
-
     /* 控制命令值映射（参考 HA 集成 const.py COMMAND_VALUE_*） */
     int lora_value;
     const char *action_name;
@@ -159,10 +177,8 @@ static void handle_control_dp(int device_index, uint32_t value)
  * @param device_index 设备索引
  * @param value 风锁模式（0=内倒模式, 1=平开模式）
  */
-static void handle_wind_lock_dp(int device_index, uint32_t value)
+static void handle_wind_lock_dp(const char *sn, uint32_t value)
 {
-    const char *sn = s_devices[device_index].device_sn;
-
     /* 仅支持风锁模式的设备才处理 */
     if (!app_tuya_bridge_supports_wind_lock(sn)) {
         PR_WARN("设备 %s 不支持风锁模式，忽略 DP 命令", sn);
@@ -220,20 +236,23 @@ void app_tuya_bridge_handle_dp_recv(dp_obj_recv_t *dpobj)
         int device_index = (dp->id - 1) / DP_PER_DEVICE;
         int dp_offset    = (dp->id - 1) % DP_PER_DEVICE;
 
-        /* 检查设备是否已注册 */
+        /* 检查设备是否已注册，并在锁保护下复制 SN */
+        char device_sn[32] = {0};
         map_lock();
         if (!s_devices[device_index].in_use) {
             map_unlock();
             PR_WARN("DP %d 对应的设备 %d 未注册，忽略", dp->id, device_index);
             continue;
         }
+        strncpy(device_sn, s_devices[device_index].device_sn, sizeof(device_sn) - 1);
+        device_sn[sizeof(device_sn) - 1] = '\0';
         map_unlock();
 
         switch (dp_offset) {
         case DP_OFFSET_CONTROL:
             /* 控制命令 DP（Enum 类型） */
             if (dp->type == PROP_ENUM) {
-                handle_control_dp(device_index, dp->value.dp_enum);
+                handle_control_dp(device_sn, dp->value.dp_enum);
             } else {
                 PR_WARN("控制 DP %d 类型错误: 期望 Enum(%d), 实际 %d", dp->id, PROP_ENUM, dp->type);
             }
@@ -242,7 +261,7 @@ void app_tuya_bridge_handle_dp_recv(dp_obj_recv_t *dpobj)
         case DP_OFFSET_WIND_LOCK:
             /* 风锁模式 DP（Enum 类型） */
             if (dp->type == PROP_ENUM) {
-                handle_wind_lock_dp(device_index, dp->value.dp_enum);
+                handle_wind_lock_dp(device_sn, dp->value.dp_enum);
             } else {
                 PR_WARN("风锁 DP %d 类型错误: 期望 Enum(%d), 实际 %d", dp->id, PROP_ENUM, dp->type);
             }

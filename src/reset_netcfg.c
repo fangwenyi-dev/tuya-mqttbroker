@@ -35,6 +35,14 @@ static int reset_count_read(uint8_t *count)
     size_t read_len;
 
     TUYA_CALL_ERR_RETURN(tal_kv_get(RESET_NETCNT_NAME, &read_buf, &read_len));
+    if (read_len == 0 || read_buf == NULL) {
+        PR_WARN("reset count KV exists but empty, treat as 0");
+        *count = 0;
+        if (read_buf != NULL) {
+            tal_kv_free(read_buf);
+        }
+        return OPRT_OK;
+    }
     *count = read_buf[0];
 
     PR_DEBUG("reset count is %d", *count);

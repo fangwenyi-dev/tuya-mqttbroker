@@ -3,6 +3,7 @@ src/tuya_config_secrets.h
 
 # 构建产物
 build/
+.build/
 *.o
 *.obj
 *.elf
@@ -10,6 +11,7 @@ build/
 *.map
 *.a
 *.lib
+build_log.txt
 
 # IDE / 编辑器
 .vscode/

@@ -41,6 +41,22 @@
 #define MQTT_MSG_QUEUE_SIZE     10
 #endif
 
+/* MQTT Broker 连接速率限制（防止 DoS）*/
+#define MAX_CONNECTS_PER_MINUTE  30
+
+/* MQTT 消息大小限制（字节）*/
+#define MQTT_MAX_PAYLOAD_SIZE    8192
+
+/* MQTT 发布重试次数 */
+#define MQTT_PUBLISH_RETRY       2
+#define MQTT_PUBLISH_RETRY_DELAY 100
+
+/* $SYS 监控主题前缀 */
+#define SYS_TOPIC_PREFIX         "$SYS/broker"
+
+/* cJSON 解析最大深度（防止恶意深层嵌套）*/
+#define CJSON_MAX_DEPTH          20
+
 /* $SH 协议常量（参考 huijian-gateway const.py） */
 #define PROTOCOL_HEAD               "$SH"
 #define TOPIC_GATEWAY_REQ_FMT       "gateway/%s/req"
@@ -142,6 +158,13 @@ static volatile bool s_bridge_running = false;
 static THREAD_HANDLE s_broker_thread = NULL;
 static volatile bool s_broker_running = false;
 
+/* 系统启动时间（用于 $SYS 上报运行时间）*/
+static uint32_t s_boot_time_ms = 0;
+
+/* Broker 连接速率限制状态 */
+static uint32_t s_connect_window_start_ms = 0;
+static int s_connect_count_in_window = 0;
+
 /* ==================== 互斥锁辅助 ==================== */
 
 static void mutex_lock(MUTEX_HANDLE mutex)
@@ -192,7 +215,7 @@ static int next_command_id(void)
 
 static void record_pending_003(int command_id, int bind)
 {
-    uint32_t now = tal_system_gettick();
+    uint32_t now = (uint32_t)tal_system_get_millisecond();
     mutex_lock(s_pending_003_mutex);
     int free_slot = -1;
     for (int i = 0; i < MAX_PENDING_003_OPS; i++) {
@@ -223,7 +246,7 @@ static void record_pending_003(int command_id, int bind)
 static int lookup_pending_003(int command_id)
 {
     int bind = -1;
-    uint32_t now = tal_system_gettick();
+    uint32_t now = (uint32_t)tal_system_get_millisecond();
     mutex_lock(s_pending_003_mutex);
     for (int i = 0; i < MAX_PENDING_003_OPS; i++) {
         if (s_pending_003_ops[i].in_use && s_pending_003_ops[i].command_id == command_id) {
@@ -252,7 +275,7 @@ static void register_gateway(const char *gw_sn)
             found_existing = true;
             was_offline = !s_gateways[i].online;
             s_gateways[i].online = true;
-            s_gateways[i].last_seen_ms = tal_system_gettick();
+            s_gateways[i].last_seen_ms = (uint32_t)tal_system_get_millisecond();
             break;
         }
         if (!s_gateways[i].in_use && new_slot < 0) new_slot = i;
@@ -261,7 +284,7 @@ static void register_gateway(const char *gw_sn)
         strncpy(s_gateways[new_slot].gateway_sn, gw_sn, sizeof(s_gateways[new_slot].gateway_sn) - 1);
         s_gateways[new_slot].gateway_sn[sizeof(s_gateways[new_slot].gateway_sn) - 1] = '\0';
         s_gateways[new_slot].online = true;
-        s_gateways[new_slot].last_seen_ms = tal_system_gettick();
+        s_gateways[new_slot].last_seen_ms = (uint32_t)tal_system_get_millisecond();
         s_gateways[new_slot].in_use = true;
     }
     mutex_unlock(s_gateways_mutex);
@@ -397,11 +420,23 @@ static void publish_mqtt_json(const char *topic, const char *json_str, const cha
 
     if (!connected) {
         PR_WARN("MQTT 客户端未连接，%s可能丢失: topic=%s", log_label, topic);
+        return;
     }
 
-    uint16_t rc = mqtt_client_publish(client, topic, (const uint8_t *)json_str, data_len, 1);
+    /* 带重试的发布 */
+    uint16_t rc = 0;
+    for (int retry = 0; retry <= MQTT_PUBLISH_RETRY; retry++) {
+        rc = mqtt_client_publish(client, topic, (const uint8_t *)json_str, data_len, 1);
+        if (rc != 0) break;
+        if (retry < MQTT_PUBLISH_RETRY) {
+            PR_WARN("发布失败 (retry %d/%d)，%s: topic=%s",
+                    retry + 1, MQTT_PUBLISH_RETRY, log_label, topic);
+            tal_system_sleep(MQTT_PUBLISH_RETRY_DELAY);
+        }
+    }
+
     if (rc == 0) {
-        PR_WARN("发布失败，%s丢失: topic=%s", log_label, topic);
+        PR_WARN("发布最终失败，%s丢失: topic=%s", log_label, topic);
     } else {
         PR_DEBUG("发布%s: topic=%s msgid=%d", log_label, topic, rc);
         app_led_flash(LED_GREEN);
@@ -852,7 +887,20 @@ static void handle_mqtt_message(const mqtt_message_t *msg)
 
     cJSON *root = cJSON_ParseWithLength(msg->data, msg->data_len);
     if (root == NULL) {
-        PR_WARN("JSON 解析失败");
+        PR_WARN("JSON 解析失败 (len=%d)", msg->data_len);
+        return;
+    }
+
+    /* cJSON 深度检查（防止恶意深层嵌套导致栈溢出）*/
+    cJSON *depth_check = root;
+    int depth = 0;
+    while (depth_check && depth < CJSON_MAX_DEPTH + 1) {
+        depth_check = depth_check->child;
+        depth++;
+    }
+    if (depth > CJSON_MAX_DEPTH) {
+        PR_WARN("JSON 嵌套深度 %d 超限 (%d)，丢弃", depth, CJSON_MAX_DEPTH);
+        cJSON_Delete(root);
         return;
     }
 
@@ -942,7 +990,20 @@ static void on_broker_message(char *client, char *topic, char *data, int len, in
 {
     if (s_mqtt_msg_queue == NULL) return;
 
-    /* 使用静态缓冲区避免每次回调在栈上分配 ~4.2KB */
+    /* 消息大小限制（DoS 防护）*/
+    if (len > MQTT_MAX_PAYLOAD_SIZE) {
+        PR_ERR("消息过大 (%d > %d)，丢弃: topic=%s", len, MQTT_MAX_PAYLOAD_SIZE,
+               topic ? topic : "(null)");
+        return;
+    }
+
+    /* 过滤 $SYS 主题（不作为 $SH 协议处理）*/
+    if (topic && strncmp(topic, "$SYS/", 5) == 0) {
+        return;
+    }
+
+    /* mosquitto broker 的 main loop 是单线程的，
+     * 此回调不会被并发调用，使用 static 缓冲区安全。*/
     static mqtt_message_t msg;
     memset(&msg, 0, sizeof(msg));
     strncpy(msg.client_id, client ? client : "", sizeof(msg.client_id) - 1);
@@ -970,9 +1031,25 @@ static void on_broker_message(char *client, char *topic, char *data, int len, in
 static int on_broker_connect(const char *client_id, const char *username,
                              const char *password, int password_len)
 {
-    /* 匿名模式（TuyaOpen 版本暂不配置 broker 认证） */
-    (void)client_id; (void)username; (void)password; (void)password_len;
-    return 0;
+    /* 连接速率限制（DoS 防护）：每分钟最多 30 次连接 */
+    uint32_t now = (uint32_t)tal_system_get_millisecond();
+    if (s_connect_window_start_ms == 0 || (now - s_connect_window_start_ms) > 60000) {
+        s_connect_window_start_ms = now;
+        s_connect_count_in_window = 0;
+    }
+    s_connect_count_in_window++;
+
+    if (s_connect_count_in_window > MAX_CONNECTS_PER_MINUTE) {
+        PR_WARN("Broker 连接速率超限（%d次/分钟），拒绝: client=%s",
+                s_connect_count_in_window, client_id ? client_id : "(null)");
+        return -1;
+    }
+
+    PR_DEBUG("Broker 连接: client=%s user=%s",
+             client_id ? client_id : "(null)",
+             username ? username : "(anonymous)");
+
+    return 0; /* 接受连接 */
 }
 
 /* ==================== MQTT 客户端 Task（TuyaOpen libmqtt） ==================== */
@@ -1131,6 +1208,9 @@ int app_protocol_bridge_init(const protocol_bridge_config_t *config)
         return -1;
     }
 
+    /* 记录启动时间 */
+    s_boot_time_ms = (uint32_t)tal_system_get_millisecond();
+
     PR_INFO("协议桥接层已初始化: bridge_sn=%s", s_bridge_sn);
     return 0;
 }
@@ -1215,35 +1295,37 @@ int app_protocol_bridge_start(void)
 
 void app_protocol_bridge_stop(void)
 {
+    /* 1. 停止 bridge task */
     s_bridge_running = false;
-
-    /* 等待 bridge task 退出 */
+    /* bridge task 在 tal_queue_fetch 超时后会检查 s_bridge_running 并退出 */
+    tal_system_sleep(1100); /* 等待队列超时 + 少量余量 */
     if (s_bridge_thread != NULL) {
         tal_thread_delete(s_bridge_thread);
         s_bridge_thread = NULL;
     }
 
-    /* 停止 broker */
-    if (s_broker_running) {
-        mosq_broker_stop();
-        s_broker_running = false;
-    }
-    if (s_broker_thread != NULL) {
-        tal_thread_delete(s_broker_thread);
-        s_broker_thread = NULL;
-    }
-
-    /* 停止 MQTT 客户端 task */
+    /* 2. 停止 MQTT 客户端 task */
     mutex_lock(s_mqtt_client_mutex);
     s_mqtt_client_should_run = false;
     mutex_unlock(s_mqtt_client_mutex);
-
+    tal_system_sleep(MQTT_YIELD_TIMEOUT_MS + 100);
     if (s_mqtt_client_thread != NULL) {
         tal_thread_delete(s_mqtt_client_thread);
         s_mqtt_client_thread = NULL;
     }
 
-    /* 断开并销毁 MQTT 客户端 */
+    /* 3. 停止 broker */
+    if (s_broker_running) {
+        mosq_broker_stop();
+        s_broker_running = false;
+    }
+    tal_system_sleep(200);
+    if (s_broker_thread != NULL) {
+        tal_thread_delete(s_broker_thread);
+        s_broker_thread = NULL;
+    }
+
+    /* 4. 断开并销毁 MQTT 客户端 */
     if (s_mqtt_client) {
         mutex_lock(s_mqtt_client_mutex);
         void *client = s_mqtt_client;
@@ -1260,7 +1342,7 @@ void app_protocol_bridge_stop(void)
 
 void app_protocol_bridge_check_gateway_offline(void)
 {
-    uint32_t now = tal_system_gettick();
+    uint32_t now = (uint32_t)tal_system_get_millisecond();
     uint32_t timeout_ms = GATEWAY_OFFLINE_TIMEOUT_SEC * 1000;
     uint32_t cleanup_ms = 3600 * 1000;
 
@@ -1438,4 +1520,57 @@ void app_protocol_bridge_reset_tuya(void)
      * tuya_iot_reset() 只接受 client 参数，调用后会触发
      * TUYA_EVENT_RESET → TUYA_EVENT_RESET_COMPLETE → tal_system_reset */
     tuya_iot_reset(tuya_iot_client_get());
+}
+
+/* ==================== $SYS 系统监控 ==================== */
+
+int app_protocol_bridge_get_online_gateway_count(void)
+{
+    int count = 0;
+    mutex_lock(s_gateways_mutex);
+    for (int i = 0; i < MAX_GATEWAYS; i++) {
+        if (s_gateways[i].in_use && s_gateways[i].online) count++;
+    }
+    mutex_unlock(s_gateways_mutex);
+    return count;
+}
+
+void app_protocol_bridge_publish_sys_stats(void)
+{
+    /* 仅在 MQTT 客户端已连接时发布 */
+    mutex_lock(s_mqtt_client_mutex);
+    bool connected = s_mqtt_client_connected;
+    void *client = s_mqtt_client;
+    mutex_unlock(s_mqtt_client_mutex);
+
+    if (!connected || client == NULL) return;
+
+    char buf[128];
+    uint32_t now = (uint32_t)tal_system_get_millisecond();
+    uint32_t uptime_s = (now - s_boot_time_ms) / 1000;
+    int dev_count = app_tuya_bridge_device_count();
+    int gw_count = app_protocol_bridge_get_online_gateway_count();
+
+    /* 运行时间 */
+    snprintf(buf, sizeof(buf), "%lu", (unsigned long)uptime_s);
+    publish_mqtt_json(SYS_TOPIC_PREFIX "/uptime", buf, "$SYS");
+
+    /* 可用内存 */
+    int free_heap = tal_system_get_free_heap_size();
+    snprintf(buf, sizeof(buf), "%d", free_heap);
+    publish_mqtt_json(SYS_TOPIC_PREFIX "/heap_free", buf, "$SYS");
+
+    /* 已注册设备数 */
+    snprintf(buf, sizeof(buf), "%d", dev_count);
+    publish_mqtt_json(SYS_TOPIC_PREFIX "/devices", buf, "$SYS");
+
+    /* 在线网关数 */
+    snprintf(buf, sizeof(buf), "%d", gw_count);
+    publish_mqtt_json(SYS_TOPIC_PREFIX "/gateways", buf, "$SYS");
+
+    /* bridge_sn（设备标识） */
+    publish_mqtt_json(SYS_TOPIC_PREFIX "/bridge_sn", s_bridge_sn, "$SYS");
+
+    PR_DEBUG("$SYS 发布: uptime=%lus heap=%d devs=%d gws=%d",
+             (unsigned long)uptime_s, free_heap, dev_count, gw_count);
 }
