@@ -29,7 +29,8 @@ static const char *TAG = "tuya_bridge";
 typedef struct {
     char    device_sn[32];   /**< LoRa 设备 SN */
     bool    in_use;          /**< 条目是否在用 */
-    bool    online;          /**< 设备在线状态 */
+    device_state_t state;    /**< 设备生命周期状态 */
+    uint32_t state_change_ms;/**< 状态变更时间戳 */
 } tuya_device_entry_t;
 
 static tuya_device_entry_t s_devices[MAX_TUYA_DEVICES] = {0};
@@ -37,6 +38,45 @@ static tuya_iot_client_t  *s_client = NULL;
 
 /** 映射表访问互斥锁（DP 接收在 yield 线程，状态上报在 bridge task） */
 static MUTEX_HANDLE       s_map_mutex = NULL;
+
+/** SN → 设备索引哈希表（FNV-1a 哈希，O(1) 平均查找） */
+static int8_t s_sn_hash_map[DEVICE_HASH_SIZE] = {0};
+
+/**
+ * @brief FNV-1a 哈希函数（轻量，适合嵌入式）
+ */
+static uint8_t sn_hash(const char *sn)
+{
+    uint32_t h = 2166136261U;
+    while (*sn) {
+        h ^= (uint8_t)(*sn++);
+        h *= 16777619U;
+    }
+    return (uint8_t)(h & (DEVICE_HASH_SIZE - 1));
+}
+
+/**
+ * @brief 更新哈希索引表
+ */
+static void hash_map_update(const char *sn, int8_t index_plus1)
+{
+    s_sn_hash_map[sn_hash(sn)] = index_plus1;
+}
+
+/**
+ * @brief 哈希查找设备索引（O(1) 平均，冲突时回退线性查找）
+ */
+static int hash_map_lookup(const char *sn)
+{
+    uint8_t h = sn_hash(sn);
+    int idx = s_sn_hash_map[h] - 1;
+    if (idx >= 0 && idx < MAX_TUYA_DEVICES &&
+        s_devices[idx].in_use &&
+        strcmp(s_devices[idx].device_sn, sn) == 0) {
+        return idx;  /* 哈希命中 */
+    }
+    return -1;  /* 未命中，调用方回退线性查找 */
+}
 
 /* DP 上报重试参数 */
 #define DP_REPORT_RETRY_COUNT   2
@@ -210,10 +250,12 @@ void app_tuya_bridge_init(tuya_iot_client_t *client)
         }
     }
 
-    /* 清空设备表 */
+    /* 清空设备表和哈希表 */
     memset(s_devices, 0, sizeof(s_devices));
+    memset(s_sn_hash_map, 0, sizeof(s_sn_hash_map));
 
-    PR_NOTICE("涂鸦 DP 桥接层已初始化 (最大设备数: %d, 每设备 %d DP)", MAX_TUYA_DEVICES, DP_PER_DEVICE);
+    PR_NOTICE("涂鸦 DP 桥接层已初始化 (最大设备数: %d, 每设备 %d DP, 哈希表: %d)",
+              MAX_TUYA_DEVICES, DP_PER_DEVICE, DEVICE_HASH_SIZE);
 }
 
 void app_tuya_bridge_handle_dp_recv(dp_obj_recv_t *dpobj)
@@ -303,7 +345,9 @@ int app_tuya_bridge_add_device(const char *device_sn)
             strncpy(s_devices[i].device_sn, device_sn, sizeof(s_devices[i].device_sn) - 1);
             s_devices[i].device_sn[sizeof(s_devices[i].device_sn) - 1] = '\0';
             s_devices[i].in_use = true;
-            s_devices[i].online = true;
+            s_devices[i].state = DEV_STATE_ONLINE;
+            s_devices[i].state_change_ms = (uint32_t)tal_system_get_millisecond();
+            hash_map_update(device_sn, (int8_t)(i + 1));
 
             bool has_wind_lock = app_tuya_bridge_supports_wind_lock(device_sn);
             PR_NOTICE("设备已注册: sn=%s 索引=%d DP范围=[%d-%d] 风锁=%s",
@@ -330,8 +374,9 @@ void app_tuya_bridge_remove_device(const char *device_sn)
     for (int i = 0; i < MAX_TUYA_DEVICES; i++) {
         if (s_devices[i].in_use && strcmp(s_devices[i].device_sn, device_sn) == 0) {
             PR_NOTICE("设备已移除: sn=%s 索引=%d", device_sn, i);
+            hash_map_update(s_devices[i].device_sn, 0);
             s_devices[i].in_use = false;
-            s_devices[i].online = false;
+            s_devices[i].state = DEV_STATE_IDLE;
             s_devices[i].device_sn[0] = '\0';
             break;
         }
@@ -347,9 +392,10 @@ void app_tuya_bridge_remove_all_devices(void)
             PR_NOTICE("移除设备: sn=%s 索引=%d", s_devices[i].device_sn, i);
         }
         s_devices[i].in_use = false;
-        s_devices[i].online = false;
+        s_devices[i].state = DEV_STATE_IDLE;
         s_devices[i].device_sn[0] = '\0';
     }
+    memset(s_sn_hash_map, 0, sizeof(s_sn_hash_map));
     map_unlock();
 }
 
@@ -425,9 +471,11 @@ void app_tuya_bridge_update_online(const char *device_sn, bool online)
     map_lock();
     for (int i = 0; i < MAX_TUYA_DEVICES; i++) {
         if (s_devices[i].in_use && strcmp(s_devices[i].device_sn, device_sn) == 0) {
-            if (s_devices[i].online != online) {
-                s_devices[i].online = online;
-                PR_NOTICE("设备在线状态变更: sn=%s online=%d", device_sn, online);
+            device_state_t new_state = online ? DEV_STATE_ONLINE : DEV_STATE_OFFLINE;
+            if (s_devices[i].state != new_state) {
+                s_devices[i].state = new_state;
+                s_devices[i].state_change_ms = (uint32_t)tal_system_get_millisecond();
+                PR_NOTICE("设备状态变更: sn=%s state=%d", device_sn, new_state);
             }
             break;
         }
@@ -457,14 +505,94 @@ int app_tuya_bridge_find_device(const char *device_sn)
 {
     if (device_sn == NULL) return -1;
 
-    int found = -1;
+    /* 快速路径：哈希查找 O(1) */
+    int found = hash_map_lookup(device_sn);
+    if (found >= 0) return found;
+
+    /* 慢速路径：线性查找 O(n)（哈希冲突或未建索引） */
     map_lock();
+    found = -1;
     for (int i = 0; i < MAX_TUYA_DEVICES; i++) {
         if (s_devices[i].in_use && strcmp(s_devices[i].device_sn, device_sn) == 0) {
             found = i;
+            /* 顺便更新哈希索引 */
+            hash_map_update(device_sn, (int8_t)(i + 1));
             break;
         }
     }
     map_unlock();
     return found;
+}
+
+void app_tuya_bridge_update_status_batch(const char *device_sn, int16_t position, int16_t battery)
+{
+    if (device_sn == NULL) return;
+
+    int idx = app_tuya_bridge_find_device(device_sn);
+    if (idx < 0) {
+        PR_WARN("设备 %s 未注册，无法批量上报", device_sn);
+        return;
+    }
+
+    /* 范围校验 */
+    bool has_pos = (position >= 0 && position <= 100);
+    bool has_bat = (battery >= 0 && battery <= 100);
+    if (!has_pos && !has_bat) return;
+
+    if (s_client == NULL) {
+        PR_ERR("client 未初始化，无法批量上报");
+        return;
+    }
+
+    /* 构造批量 DP 上报 */
+    dp_obj_t dps[2];
+    int count = 0;
+    int time_stamp = tal_time_get_posix();
+
+    if (has_pos) {
+        dps[count].id = app_tuya_bridge_dp_id(idx, DP_OFFSET_POSITION);
+        dps[count].type = PROP_VALUE;
+        dps[count].value.dp_value = position;
+        dps[count].time_stamp = time_stamp;
+        count++;
+    }
+    if (has_bat) {
+        dps[count].id = app_tuya_bridge_dp_id(idx, DP_OFFSET_BATTERY);
+        dps[count].type = PROP_VALUE;
+        dps[count].value.dp_value = battery;
+        dps[count].time_stamp = time_stamp;
+        count++;
+    }
+
+    int rt = OPRT_COM_ERROR;
+    for (int retry = 0; retry <= DP_REPORT_RETRY_COUNT; retry++) {
+        rt = tuya_iot_dp_obj_report(s_client, NULL, dps, count, 0);
+        if (rt == OPRT_OK) break;
+        if (retry < DP_REPORT_RETRY_COUNT) {
+            PR_WARN("批量 DP 上报失败 (retry %d/%d): %d", retry + 1, DP_REPORT_RETRY_COUNT, rt);
+            tal_system_sleep(DP_REPORT_RETRY_DELAY);
+        }
+    }
+    if (rt == OPRT_OK) {
+        PR_DEBUG("批量 DP 上报成功: dev=%s pos=%d bat=%d", device_sn,
+                 has_pos ? position : -1, has_bat ? battery : -1);
+    } else {
+        PR_ERR("批量 DP 上报最终失败: %d", rt);
+    }
+}
+
+device_state_t app_tuya_bridge_get_state(const char *device_sn)
+{
+    if (device_sn == NULL) return DEV_STATE_IDLE;
+
+    device_state_t state = DEV_STATE_IDLE;
+    map_lock();
+    for (int i = 0; i < MAX_TUYA_DEVICES; i++) {
+        if (s_devices[i].in_use && strcmp(s_devices[i].device_sn, device_sn) == 0) {
+            state = s_devices[i].state;
+            break;
+        }
+    }
+    map_unlock();
+    return state;
 }

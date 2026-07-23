@@ -1,0 +1,76 @@
+# Doxyfile - TuyaOpen Window Broker 文档生成配置
+# 生成命令: cd docs && doxygen Doxyfile
+
+PROJECT_NAME           = "TuyaOpen Window Broker"
+PROJECT_NUMBER         = "2.0.0"
+PROJECT_BRIEF          = "智能开窗器 LoRa 网关 MQTT 桥接器"
+PROJECT_ICON           = 
+PROJECT_LOGO           = 
+
+OUTPUT_DIRECTORY       = .
+CREATE_SUBDIRS         = YES
+ALLOW_UNICODE_NAMES    = YES
+
+# 输入文件
+INPUT                  = ../TuyaOpen/apps/tuya_cloud/window_broker/src \
+                         ../TuyaOpen/apps/tuya_cloud/window_broker/include \
+                         ../docs/adr
+INPUT_ENCODING         = UTF-8
+FILE_PATTERNS          = *.c *.h *.cpp *.hpp *.cc *.hh *.py *.md
+RECURSIVE              = YES
+EXCLUDE_PATTERNS       = */.build/* */.cache/* */test/*
+
+# 预处理
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = NO
+SEARCH_INCLUDES        = YES
+
+PREDEFINED             = PLATFORM_ESP32=1 \
+                         ENABLE_WIFI=1 \
+                         ENABLE_LIBLWIP=1 \
+                         OPERATING_SYSTEM=0 \
+                         SYSTEM_LINUX=0
+
+# 语言设置
+OPTIMIZE_OUTPUT_FOR_C  = YES
+TYPEDEF_HIDES_STRUCT   = YES
+EXTRACT_ALL            = YES
+EXTRACT_PRIVATE        = YES
+EXTRACT_STATIC         = YES
+EXTRACT_LOCAL_CLASSES  = YES
+
+# HTML 输出
+GENERATE_HTML          = YES
+HTML_OUTPUT            = html
+HTML_DYNAMIC_SECTIONS  = YES
+GENERATE_TREEVIEW      = YES
+DISABLE_INDEX          = NO
+GENERATE_HTMLHELP      = NO
+
+# LaTeX 输出
+GENERATE_LATEX         = NO
+
+# XML 输出（供 IDE 插件使用）
+GENERATE_XML           = YES
+XML_OUTPUT             = xml
+
+# 警告
+WARN_IF_UNDOCUMENTED   = YES
+WARN_IF_DOC_ERROR      = YES
+WARN_NO_PARAMDOC       = YES
+
+# 图表
+HAVE_DOT               = YES
+UML_LOOK               = YES
+CALL_GRAPH             = YES
+CALLER_GRAPH           = YES
+GRAPHICAL_HIERARCHY    = YES
+DIRECTORY_GRAPH        = YES
+COLLABORATION_GRAPH    = YES
+INCLUDE_GRAPH          = YES
+
+# 中文注释支持
+INPUT_ENCODING         = UTF-8
+OUTPUT_LANGUAGE        = Chinese
+USE_WINDOWS_ENCODING   = NO

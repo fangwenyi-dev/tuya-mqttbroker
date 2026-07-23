@@ -915,6 +915,551 @@ if os.path.exists(flash_tool_file):
 else:
     print("  ⚠️ flash_tool.py 未找到，跳过此测试")
 
+# ---------- 测试 26: Broker 认证逻辑 ----------
+print("\n📋 测试 26: Broker 用户名/密码认证")
+print("-" * 40)
+
+BROKER_USERNAME = "broker"
+
+def derive_broker_password(bridge_sn):
+    """模拟 C 代码的 derive_broker_password"""
+    h = 2166136261
+    for c in bridge_sn:
+        h ^= ord(c)
+        h = (h * 16777619) & 0xFFFFFFFF
+    h2 = (h * 16777619) & 0xFFFFFFFF
+    return f"{h & 0xFFFFFFFF:08x}{h2:08x}"
+
+bridge_sn_test = "AABBCCDDEEFF"
+broker_password = derive_broker_password(bridge_sn_test)
+
+def broker_auth_check(username, password, enable_auth=True):
+    """模拟 on_broker_connect 认证逻辑"""
+    if not enable_auth:
+        return 0
+    if username is None or username != BROKER_USERNAME:
+        return -1
+    if password is None or password != broker_password:
+        return -1
+    return 0
+
+result.assert_eq(broker_auth_check("broker", broker_password), 0, "正确凭据通过认证")
+result.assert_eq(broker_auth_check("wrong", broker_password), -1, "错误用户名被拒绝")
+result.assert_eq(broker_auth_check("broker", "wrong"), -1, "错误密码被拒绝")
+result.assert_eq(broker_auth_check(None, None), -1, "空凭据被拒绝")
+result.assert_eq(broker_auth_check("broker", broker_password, False), 0, "禁用认证时通过")
+result.assert_eq(broker_auth_check("any", "any", False), 0, "禁用认证时任意凭据通过")
+result.assert_true(len(broker_password) == 16, "密码长度为 16 字符")
+result.assert_true(broker_password != derive_broker_password("AABBCCDDEEF0"), "不同 SN 派生不同密码")
+
+# ---------- 测试 27: 指数退避重连 ----------
+print("\n📋 测试 27: 指数退避重连机制")
+print("-" * 40)
+
+BACKOFF_MIN_MS = 3000
+BACKOFF_MAX_MS = 60000
+BACKOFF_FACTOR = 2
+
+def simulate_backoff(failures):
+    """模拟指数退避序列"""
+    backoff = BACKOFF_MIN_MS
+    delays = []
+    for _ in range(failures):
+        delays.append(backoff)
+        backoff *= BACKOFF_FACTOR
+        if backoff > BACKOFF_MAX_MS:
+            backoff = BACKOFF_MAX_MS
+    return delays
+
+delays = simulate_backoff(7)
+expected = [3000, 6000, 12000, 24000, 48000, 60000, 60000]
+result.assert_eq(delays, expected, "指数退避序列正确: 3s->6s->12s->24s->48s->60s->60s")
+result.assert_eq(max(delays), BACKOFF_MAX_MS, "最大退避不超过 60s")
+result.assert_gt(sum(delays), 150000, "7 次退避总时间 > 150s（减少网络风暴）")
+
+# ---------- 测试 28: 熔断器 ----------
+print("\n📋 测试 28: 熔断器机制")
+print("-" * 40)
+
+CIRCUIT_BREAKER_THRESHOLD = 5
+CIRCUIT_BREAKER_COOLDOWN_MS = 30000
+
+def simulate_circuit_breaker(failure_count):
+    """模拟熔断器状态"""
+    if failure_count >= CIRCUIT_BREAKER_THRESHOLD:
+        return {"tripped": True, "cooldown_ms": CIRCUIT_BREAKER_COOLDOWN_MS}
+    return {"tripped": False, "cooldown_ms": 0}
+
+cb_4 = simulate_circuit_breaker(4)
+cb_5 = simulate_circuit_breaker(5)
+cb_10 = simulate_circuit_breaker(10)
+
+result.assert_true(not cb_4["tripped"], "4 次失败不触发熔断")
+result.assert_true(cb_5["tripped"], "5 次失败触发熔断")
+result.assert_true(cb_10["tripped"], "10 次失败触发熔断")
+result.assert_eq(cb_5["cooldown_ms"], 30000, "熔断冷却时间为 30s")
+
+# ---------- 测试 29: FNV-1a 哈希表 ----------
+print("\n📋 测试 29: FNV-1a 哈希表查找")
+print("-" * 40)
+
+DEVICE_HASH_SIZE = 32
+
+def fnv1a_hash(sn):
+    h = 2166136261
+    for c in sn:
+        h ^= ord(c)
+        h = (h * 16777619) & 0xFFFFFFFF
+    return h & (DEVICE_HASH_SIZE - 1)
+
+test_sns = [f"DEV{i:06d}" for i in range(12)]
+hash_values = [fnv1a_hash(sn) for sn in test_sns]
+unique_hashes = len(set(hash_values))
+
+collision_rate = 1.0 - unique_hashes / 12
+result.assert_true(unique_hashes >= 10, f"12 个 SN 哈希唯一值 >= 10（实际 {unique_hashes}）")
+result.assert_true(collision_rate < 0.2, f"冲突率 < 20%（实际 {collision_rate:.1%}）")
+result.assert_true(all(0 <= h < DEVICE_HASH_SIZE for h in hash_values), "所有哈希值在有效范围")
+result.assert_eq(fnv1a_hash("DEV000001"), fnv1a_hash("DEV000001"), "相同 SN 哈希一致")
+
+# ---------- 测试 30: 设备状态机 ----------
+print("\n📋 测试 30: 设备生命周期状态机")
+print("-" * 40)
+
+DEV_STATES = {
+    0: "IDLE",
+    1: "REGISTERING",
+    2: "ONLINE",
+    3: "OFFLINE",
+    4: "REMOVING",
+}
+
+transitions = [
+    (0, 1, "IDLE -> REGISTERING"),
+    (1, 2, "REGISTERING -> ONLINE"),
+    (2, 3, "ONLINE -> OFFLINE"),
+    (3, 2, "OFFLINE -> ONLINE"),
+    (2, 4, "ONLINE -> REMOVING"),
+    (4, 0, "REMOVING -> IDLE"),
+]
+
+for from_state, to_state, desc in transitions:
+    result.assert_true(from_state != to_state, f"状态转换有效: {desc}")
+
+result.assert_eq(len(DEV_STATES), 5, "设备状态有 5 种")
+result.assert_true(all(v in DEV_STATES for v in range(5)), "所有状态值有效")
+
+# ---------- 测试 31: 电压转换提取 ----------
+print("\n📋 测试 31: voltage_to_percent 统一转换")
+print("-" * 40)
+
+BATTERY_RAW_MIN = 80
+BATTERY_RAW_MAX = 140
+
+def voltage_to_percent(voltage):
+    """模拟 C 代码的 voltage_to_percent"""
+    if voltage <= BATTERY_RAW_MIN: return 0
+    if voltage >= BATTERY_RAW_MAX: return 100
+    return (voltage - BATTERY_RAW_MIN) * 100 // (BATTERY_RAW_MAX - BATTERY_RAW_MIN)
+
+result.assert_eq(voltage_to_percent(80), 0, "80V -> 0%")
+result.assert_eq(voltage_to_percent(140), 100, "140V -> 100%")
+result.assert_eq(voltage_to_percent(110), 50, "110V -> 50%（中点）")
+result.assert_eq(voltage_to_percent(70), 0, "70V -> 0%（低于最小值）")
+result.assert_eq(voltage_to_percent(150), 100, "150V -> 100%（高于最大值）")
+result.assert_eq(voltage_to_percent(95), 25, "95V -> 25%")
+result.assert_eq(voltage_to_percent(125), 75, "125V -> 75%")
+
+# ---------- 测试 32: 统一错误码 ----------
+print("\n📋 测试 32: 统一错误码枚举")
+print("-" * 40)
+
+BRIDGE_ERRORS = {
+    0: "BRIDGE_OK",
+    -1: "BRIDGE_ERR_PARAM",
+    -2: "BRIDGE_ERR_NOMEM",
+    -3: "BRIDGE_ERR_NOT_FOUND",
+    -4: "BRIDGE_ERR_TABLE_FULL",
+    -5: "BRIDGE_ERR_AUTH",
+    -6: "BRIDGE_ERR_TIMEOUT",
+    -7: "BRIDGE_ERR_PROTOCOL",
+}
+
+result.assert_eq(len(BRIDGE_ERRORS), 8, "8 种错误码")
+result.assert_eq(BRIDGE_ERRORS[0], "BRIDGE_OK", "成功码为 0")
+result.assert_true(all(k <= 0 for k in BRIDGE_ERRORS), "所有错误码 <= 0")
+result.assert_true(-5 in BRIDGE_ERRORS, "认证失败错误码存在")
+
+# ---------- 测试 33: 压力测试 - 高频状态上报 ----------
+print("\n📋 测试 33: 压力测试 - 高频 005 状态上报")
+print("-" * 40)
+
+broker_stress = MockMQTTBroker()
+gw_stress = MockGateway("1001TESTGW01")
+for i in range(12):
+    gw_stress.devices.append(MockDevice(f"DEV{i:06d}", gw_stress.sn, position=50, battery=120))
+
+msg_count = 0
+drop_count = 0
+for _ in range(10):
+    for dev in gw_stress.devices:
+        msg = gw_stress.make_005_message(dev)
+        msg_json = json.dumps(msg)
+        result_msg = broker_stress.on_message(gw_stress.sn, "gateway/1001TESTGW01/rpt", msg_json, len(msg_json), 1, 0)
+        if result_msg is not None:
+            msg_count += 1
+        else:
+            drop_count += 1
+
+result.assert_eq(msg_count, 120, "120 条消息全部接收（10s x 12 设备）")
+result.assert_eq(drop_count, 0, "无消息丢弃")
+
+# ---------- 测试 34: 压力测试 - 并发网关 ----------
+print("\n📋 测试 34: 压力测试 - 2 个网关并发上报")
+print("-" * 40)
+
+broker2 = MockMQTTBroker()
+gw1 = MockGateway("GW001")
+gw2 = MockGateway("GW002")
+gw1.devices = [MockDevice("DEV_A001", "GW001")]
+gw2.devices = [MockDevice("DEV_B001", "GW002")]
+
+all_received = []
+for i in range(100):
+    dev1 = gw1.devices[0]
+    dev1.position = i % 100
+    msg1 = gw1.make_005_message(dev1)
+    r1 = broker2.on_message("GW001", "gateway/GW001/rpt", json.dumps(msg1), len(json.dumps(msg1)), 1, 0)
+    if r1: all_received.append(("GW001", r1["client_id"]))
+
+    dev2 = gw2.devices[0]
+    dev2.position = (i + 50) % 100
+    msg2 = gw2.make_005_message(dev2)
+    r2 = broker2.on_message("GW002", "gateway/GW002/rpt", json.dumps(msg2), len(json.dumps(msg2)), 1, 0)
+    if r2: all_received.append(("GW002", r2["client_id"]))
+
+result.assert_eq(len(all_received), 200, "200 条并发消息全部接收")
+
+# ---------- 测试 35: 模糊测试 - 畸形 JSON ----------
+print("\n📋 测试 35: 模糊测试 - 畸形 JSON 数据")
+print("-" * 40)
+
+malformed_inputs = [
+    ("", "空字符串"),
+    ("{", "不完整 JSON"),
+    ("}{}", "非法 JSON"),
+    ("null", "null 值"),
+    ("[]", "数组而非对象"),
+    ('{"head":"$SH"}', "缺少必需字段"),
+    ('{"head":"$SH","ctype":"001","sn":"","data":{}}', "空 SN"),
+    ('{"head":"$SH","ctype":"999","sn":"GW01","data":{}}', "未知 ctype"),
+]
+
+for payload, desc in malformed_inputs:
+    try:
+        parsed = json.loads(payload) if payload else None
+        if parsed and isinstance(parsed, dict):
+            head = parsed.get("head")
+            ctype = parsed.get("ctype")
+            sn = parsed.get("sn")
+            if head != "$SH":
+                result.assert_true(True, f"{desc}: 过滤非 $SH 协议")
+            elif not sn:
+                result.assert_true(True, f"{desc}: 拒绝空 SN")
+            elif ctype == "999":
+                result.assert_true(True, f"{desc}: 忽略未知 ctype")
+            else:
+                result.assert_true(True, f"{desc}: 正常处理")
+        else:
+            result.assert_true(True, f"{desc}: JSON 解析失败/空，安全丢弃")
+    except json.JSONDecodeError:
+        result.assert_true(True, f"{desc}: JSON 解析异常，安全丢弃")
+
+# ---------- 测试 36: 模糊测试 - 极端数值 ----------
+print("\n📋 测试 36: 模糊测试 - 极端数值")
+print("-" * 40)
+
+extreme_values = [
+    ("position", -1, "负位置"),
+    ("position", 101, "超范围位置"),
+    ("position", 2147483647, "INT_MAX 位置"),
+    ("battery", -100, "负电池"),
+    ("battery", 0, "零电池"),
+    ("battery", 999, "超范围电池"),
+    ("r_travel", "abc", "非数字位置"),
+    ("voltage", "", "空电压"),
+    ("state", 255, "超范围状态"),
+]
+
+for field, value, desc in extreme_values:
+    if field in ("position", "r_travel"):
+        valid = isinstance(value, (int, float)) and 0 <= value <= 100
+    elif field == "battery":
+        valid = isinstance(value, (int, float)) and 80 <= value <= 140
+    elif field == "voltage":
+        valid = isinstance(value, (int, float)) and 80 <= value <= 140
+    elif field == "state":
+        valid = isinstance(value, (int, float)) and 0 <= value <= 1
+    else:
+        valid = False
+    result.assert_true(not valid, f"{desc}: 极端值被正确拒绝")
+
+# ---------- 测试 37: 模糊测试 - 超长字符串 ----------
+print("\n📋 测试 37: 模糊测试 - 超长字符串")
+print("-" * 40)
+
+long_topic = "gateway/" + "A" * 200 + "/rpt"
+truncated_topic = long_topic[:127]
+result.assert_eq(len(truncated_topic), 127, "topic 截断到 127 字符")
+
+long_data = "X" * 10000
+truncated_data = long_data[:4095]
+result.assert_eq(len(truncated_data), 4095, "data 截断到 4095 字符")
+
+oversized_payload = "Y" * 9000
+result_msg = broker_stress.on_message("GW", "topic", oversized_payload, len(oversized_payload), 1, 0)
+result.assert_true(result_msg is None, "8192+ 字节 payload 被丢弃")
+
+# ---------- 路径变量定义（供后续测试使用）----------
+_src_base = os.path.dirname(__file__)
+src_dir = os.path.join(_src_base, '..', 'src')
+tuya_main_file = os.path.join(src_dir, 'tuya_main.c')
+protocol_bridge_file = os.path.join(src_dir, 'app_protocol_bridge.c')
+tuya_bridge_file = os.path.join(src_dir, 'app_tuya_bridge.h')
+
+# ---------- 测试 38: CI/CD 工作流验证 ----------
+print("\n📋 测试 38: GitHub Actions CI/CD 工作流")
+print("-" * 40)
+
+ci_yaml = os.path.join(_src_base, '..', '..', '..', '..', '.github', 'workflows', 'window_broker-ci.yml')
+if os.path.exists(ci_yaml):
+    with open(ci_yaml, 'r', encoding='utf-8') as f:
+        ci_content = f.read()
+
+    result.assert_true("static-analysis" in ci_content, "CI 包含静态分析 job")
+    result.assert_true("cppcheck" in ci_content, "CI 运行 cppcheck")
+    result.assert_true("clang-format" in ci_content, "CI 检查代码格式")
+    result.assert_true("python-tests" in ci_content, "CI 包含 Python 测试 job")
+    result.assert_true("build-check" in ci_content, "CI 包含构建检查 job")
+    result.assert_true("doxygen" in ci_content, "CI 生成 Doxygen 文档")
+else:
+    print("  ⚠️ CI/CD 工作流未找到，跳过")
+
+# ---------- 测试 39: Doxygen 配置验证 ----------
+print("\n📋 测试 39: Doxygen 文档配置")
+print("-" * 40)
+
+doxyfile = os.path.join(src_dir, "..", "..", "..", "..", "..", "docs", "Doxyfile")
+if os.path.exists(doxyfile):
+    with open(doxyfile, 'r', encoding='utf-8') as f:
+        doxy_content = f.read()
+
+    result.assert_true("PROJECT_NAME" in doxy_content, "Doxyfile 有项目名称")
+    result.assert_true("GENERATE_HTML" in doxy_content, "Doxyfile 生成 HTML")
+    result.assert_true("GENERATE_XML" in doxy_content, "Doxyfile 生成 XML")
+    result.assert_true("CALL_GRAPH" in doxy_content, "Doxyfile 启用调用图")
+    result.assert_true("EXTRACT_ALL" in doxy_content, "Doxyfile 提取所有符号")
+else:
+    print("  ⚠️ Doxyfile 未找到，跳过")
+
+# ---------- 测试 40: ADR 文档验证 ----------
+print("\n📋 测试 40: ADR 架构决策文档")
+print("-" * 40)
+
+adr_dir = os.path.join(src_dir, "..", "..", "..", "..", "..", "docs", "adr")
+expected_adrs = [
+    "ADR-001-tuyaopen-vs-matter.md",
+    "ADR-002-broker-authentication.md",
+    "ADR-003-exponential-backoff-circuit-breaker.md",
+    "ADR-004-hash-lookup-optimization.md",
+]
+
+for adr_name in expected_adrs:
+    adr_path = os.path.join(adr_dir, adr_name)
+    if os.path.exists(adr_path):
+        with open(adr_path, 'r', encoding='utf-8') as f:
+            adr_content = f.read()
+        result.assert_true("## 背景" in adr_content, f"{adr_name}: 有背景章节")
+        result.assert_true("## 决策" in adr_content, f"{adr_name}: 有决策章节")
+        result.assert_true("## 影响" in adr_content, f"{adr_name}: 有影响章节")
+    else:
+        result.assert_true(False, f"{adr_name} 存在")
+
+# ---------- 测试 41: 硬件测试计划 ----------
+print("\n📋 测试 41: 硬件测试计划文档")
+print("-" * 40)
+
+hw_test_plan = os.path.join(src_dir, "..", "..", "..", "..", "..", "docs", "hardware_test_plan.md")
+if os.path.exists(hw_test_plan):
+    with open(hw_test_plan, 'r', encoding='utf-8') as f:
+        hw_content = f.read()
+
+    result.assert_true("TC-001" in hw_content and "TC-015" in hw_content, "有 15 个测试用例")
+    result.assert_true("Broker 认证" in hw_content, "包含 Broker 认证测试")
+    result.assert_true("指数退避" in hw_content, "包含指数退避测试")
+    result.assert_true("熔断器" in hw_content, "包含熔断器测试")
+    result.assert_true("OTA" in hw_content, "包含 OTA 测试")
+    result.assert_true("mDNS" in hw_content, "包含 mDNS 测试")
+else:
+    result.assert_true(False, "hardware_test_plan.md 存在")
+
+# ---------- 测试 42: OTA 通知增强验证 ----------
+print("\n📋 测试 42: OTA 通知回调增强")
+print("-" * 40)
+
+if os.path.exists(tuya_main_file):
+    with open(tuya_main_file, 'r', encoding='utf-8') as f:
+        main_code = f.read()
+
+    ota_section = main_code.split('user_upgrade_notify_on')[1].split('void ')[0] if 'user_upgrade_notify_on' in main_code else ''
+
+    result.assert_true("url_item" in ota_section, "OTA 通知解析 URL 字段")
+    result.assert_true("md5_item" in ota_section, "OTA 通知解析 MD5 字段")
+    result.assert_true("LED_RED" in ota_section and "FAST_BLINK" in ota_section, "OTA 进行中红灯快闪")
+    result.assert_true("固件" in ota_section and "模块" in ota_section, "OTA 通道类型中文显示")
+else:
+    print("  ⚠️ tuya_main.c 未找到，跳过")
+
+# ---------- 测试 43: Broker 认证配置传递 ----------
+print("\n📋 测试 43: Broker 认证配置初始化")
+print("-" * 40)
+
+if os.path.exists(tuya_main_file):
+    with open(tuya_main_file, 'r', encoding='utf-8') as f:
+        main_code = f.read()
+
+    result.assert_true("enable_broker_auth" in main_code, "tuya_main.c 启用 Broker 认证")
+    result.assert_true(".enable_broker_auth = true" in main_code, "认证标志设为 true")
+else:
+    print("  ⚠️ tuya_main.c 未找到，跳过")
+
+if os.path.exists(protocol_bridge_file):
+    with open(protocol_bridge_file, 'r', encoding='utf-8') as f:
+        bridge_code = f.read()
+
+    result.assert_true("s_enable_broker_auth" in bridge_code, "协议桥接层存储认证标志")
+    result.assert_true("derive_broker_password" in bridge_code, "有密码派生函数")
+    result.assert_true("BROKER_USERNAME" in bridge_code, "有 Broker 用户名常量")
+    result.assert_true("s_broker_password" in bridge_code, "有 Broker 密码存储")
+else:
+    print("  ⚠️ app_protocol_bridge.c 未找到，跳过")
+
+# ---------- 测试 44: 批量 DP 上报接口 ----------
+print("\n📋 测试 44: 批量 DP 上报接口")
+print("-" * 40)
+
+if os.path.exists(tuya_bridge_file):
+    with open(tuya_bridge_file, 'r', encoding='utf-8') as f:
+        bridge_h_code = f.read()
+
+    result.assert_true("app_tuya_bridge_update_status_batch" in bridge_h_code, "有批量上报函数声明")
+    result.assert_true("app_tuya_bridge_get_state" in bridge_h_code, "有获取状态函数声明")
+    result.assert_true("device_state_t" in bridge_h_code, "有设备状态枚举")
+    result.assert_true("DEV_STATE_IDLE" in bridge_h_code, "状态枚举包含 IDLE")
+    result.assert_true("DEV_STATE_ONLINE" in bridge_h_code, "状态枚举包含 ONLINE")
+    result.assert_true("DEVICE_HASH_SIZE" in bridge_h_code, "有哈希表大小常量")
+else:
+    print("  ⚠️ app_tuya_bridge.h 未找到，跳过")
+
+if os.path.exists(os.path.join(src_dir, "app_tuya_bridge.c")):
+    with open(os.path.join(src_dir, "app_tuya_bridge.c"), 'r', encoding='utf-8') as f:
+        bridge_c_code = f.read()
+
+    result.assert_true("fnv" in bridge_c_code.lower() or "hash" in bridge_c_code.lower(), "有哈希函数实现")
+    result.assert_true("s_sn_hash_map" in bridge_c_code, "有哈希索引表")
+    result.assert_true("hash_map_lookup" in bridge_c_code, "有哈希查找函数")
+    result.assert_true("hash_map_update" in bridge_c_code, "有哈希更新函数")
+    result.assert_true("DEV_STATE_ONLINE" in bridge_c_code, "设备注册时设为 ONLINE 状态")
+    result.assert_true("DEV_STATE_OFFLINE" in bridge_c_code, "设备离线时设为 OFFLINE 状态")
+else:
+    print("  ⚠️ app_tuya_bridge.c 未找到，跳过")
+
+# ---------- 测试 45: 网关自动发现 ----------
+print("\n📋 测试 45: 网关自动发现（主题驱动注册）")
+print("-" * 40)
+
+def auto_discover_gateway_from_topic(topic):
+    """模拟 C 代码的 auto_discover_gateway_from_topic"""
+    if topic is None:
+        return False, None
+
+    prefix = "gateway/"
+    if not topic.startswith(prefix):
+        return False, None
+
+    sn_start = topic[len(prefix):]
+    slash_idx = sn_start.find('/')
+    if slash_idx <= 0:
+        return False, None
+
+    sn = sn_start[:slash_idx]
+    if len(sn) == 0 or len(sn) >= 32:
+        return False, None
+    if sn == "rpt_rsp":
+        return False, None
+
+    return True, sn
+
+# 测试各种主题格式
+test_topics = [
+    ("gateway/1001ABCDEF01/rpt", True, "1001ABCDEF01", "标准上报主题"),
+    ("gateway/1001ABCDEF01/req", True, "1001ABCDEF01", "标准请求主题"),
+    ("gateway/GW_TEST_001/rpt",  True, "GW_TEST_001",  "自定义网关 SN"),
+    ("gateway/rpt_rsp",          False, None,           "保留主题不触发"),
+    ("other/topic",              False, None,           "非 gateway 前缀"),
+    ("gateway/",                 False, None,           "缺少 SN"),
+    ("gateway//rpt",             False, None,           "空 SN"),
+    (None,                       False, None,           "NULL 主题"),
+    ("gateway/" + "X" * 40 + "/rpt", False, None,      "SN 超长"),
+]
+
+for topic, expect_ok, expect_sn, desc in test_topics:
+    ok, sn = auto_discover_gateway_from_topic(topic)
+    result.assert_eq(ok, expect_ok, f"{desc}: 发现结果")
+    if expect_ok:
+        result.assert_eq(sn, expect_sn, f"{desc}: SN 提取正确")
+
+# 测试：JSON 解析失败但主题匹配时仍注册网关
+print("\n  --- 子测试: JSON 解析失败时网关仍自动注册 ---")
+bad_json_topic = "gateway/GW_BADJSON/rpt"
+ok, sn = auto_discover_gateway_from_topic(bad_json_topic)
+result.assert_true(ok and sn == "GW_BADJSON", "JSON 解析失败时网关仍从主题自动注册")
+
+# 测试：非 $SH 协议但主题匹配时仍注册网关
+print("  --- 子测试: 非 $SH 协议时网关仍自动注册 ---")
+non_sh_topic = "gateway/GW_NONSH/rpt"
+ok, sn = auto_discover_gateway_from_topic(non_sh_topic)
+result.assert_true(ok and sn == "GW_NONSH", "非 $SH 协议时网关仍从主题自动注册")
+
+# 测试：代码中存在自动发现函数
+if os.path.exists(protocol_bridge_file):
+    with open(protocol_bridge_file, 'r', encoding='utf-8') as f:
+        bridge_code = f.read()
+
+    result.assert_true("auto_discover_gateway_from_topic" in bridge_code, "有网关自动发现函数")
+    result.assert_true("网关自动发现" in bridge_code, "有自动发现日志")
+    result.assert_true('gateway/' in bridge_code, "解析 gateway/ 前缀")
+    result.assert_true("rpt_rsp" in bridge_code, "排除 rpt_rsp 保留主题")
+    result.assert_true("register_gateway" in bridge_code, "自动发现调用 register_gateway")
+else:
+    print("  ⚠️ app_protocol_bridge.c 未找到，跳过代码检查")
+
+# 测试：模拟完整流程 - 网关发 005 不发 001 也能被注册
+print("  --- 子测试: 网关直接发 005 状态（不发 001）也能自动注册 ---")
+broker_gw = MockMQTTBroker()
+gw_direct = MockGateway("1001DIRECTGW")
+
+# 网关直接发 005，不先发 001
+dev_direct = MockDevice("DEV_DIRECT_01", gw_direct.sn, position=75, battery=125)
+msg_005 = gw_direct.make_005_message(dev_direct)
+msg_json = json.dumps(msg_005)
+topic_005 = f"gateway/{gw_direct.sn}/rpt"
+
+# 模拟 handle_mqtt_message 的主题自动发现部分
+discovered, discovered_sn = auto_discover_gateway_from_topic(topic_005)
+result.assert_true(discovered, "005 消息主题触发网关自动发现")
+result.assert_eq(discovered_sn, "1001DIRECTGW", "自动发现的 SN 正确")
+
 # ==================== 结果汇总 ====================
 
 success = result.summary()

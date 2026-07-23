@@ -83,6 +83,19 @@
 /* MQTT 客户端 yield 超时 */
 #define MQTT_YIELD_TIMEOUT_MS      1000
 
+/* 指数退避重连参数 */
+#define MQTT_BACKOFF_MIN_MS        3000    /**< 初始退避 3s */
+#define MQTT_BACKOFF_MAX_MS        60000   /**< 最大退避 60s */
+#define MQTT_BACKOFF_FACTOR        2       /**< 退避倍数 */
+
+/* 熔断器参数 */
+#define CIRCUIT_BREAKER_THRESHOLD  5       /**< 连续失败 5 次触发熔断 */
+#define CIRCUIT_BREAKER_COOLDOWN_MS 30000  /**< 熔断冷却 30s */
+
+/* Broker 认证凭据 */
+#define BROKER_USERNAME            "broker"
+#define BROKER_PASSWORD_LEN        16
+
 /* ==================== 消息结构 ==================== */
 
 typedef struct {
@@ -99,6 +112,8 @@ typedef struct {
 static const char *TAG = "proto_bridge";
 
 static char s_bridge_sn[32] = {0};
+static bool s_enable_broker_auth = false;
+static char s_broker_password[BROKER_PASSWORD_LEN + 1] = {0};
 
 /* MQTT 消息队列（来自 mosquitto broker 的回调推入） */
 static QUEUE_HANDLE s_mqtt_msg_queue = NULL;
@@ -178,6 +193,33 @@ static void mutex_unlock(MUTEX_HANDLE mutex)
 }
 
 /* ==================== 辅助函数 ==================== */
+
+/**
+ * @brief 电压原始值 → 百分比（统一提取，避免重复逻辑）
+ *
+ * 12V 锂电池线性映射：BATTERY_RAW_MIN-BATTERY_RAW_MAX → 0-100
+ */
+static uint8_t voltage_to_percent(int voltage)
+{
+    if (voltage <= BATTERY_RAW_MIN) return 0;
+    if (voltage >= BATTERY_RAW_MAX) return 100;
+    return (uint8_t)((voltage - BATTERY_RAW_MIN) * 100 / (BATTERY_RAW_MAX - BATTERY_RAW_MIN));
+}
+
+/**
+ * @brief 从 bridge_sn 派生 Broker 密码（确定性，无需存储）
+ */
+static void derive_broker_password(void)
+{
+    uint32_t h = 2166136261U;
+    for (int i = 0; s_bridge_sn[i] && i < 32; i++) {
+        h ^= (uint8_t)s_bridge_sn[i];
+        h *= 16777619U;
+    }
+    uint32_t h2 = h * 16777619U;
+    snprintf(s_broker_password, sizeof(s_broker_password), "%08x%08x",
+             (unsigned)h, (unsigned)h2);
+}
 
 /**
  * @brief 从 cJSON 字段解析数值（兼容字符串和数字类型）
@@ -663,16 +705,7 @@ static void handle_ctype_002(const char *gw_sn, cJSON *data, int msg_id)
             app_tuya_bridge_update_position(dev_sn, (uint8_t)init_pos);
         }
         if (init_voltage >= 0) {
-            /* 电压原始值 → 百分比（简单线性映射：80-140 → 0-100） */
-            uint8_t percent = 0;
-            if (init_voltage <= BATTERY_RAW_MIN) {
-                percent = 0;
-            } else if (init_voltage >= BATTERY_RAW_MAX) {
-                percent = 100;
-            } else {
-                percent = (uint8_t)((init_voltage - BATTERY_RAW_MIN) * 100 / (BATTERY_RAW_MAX - BATTERY_RAW_MIN));
-            }
-            app_tuya_bridge_update_battery(dev_sn, percent);
+            app_tuya_bridge_update_battery(dev_sn, voltage_to_percent(init_voltage));
         }
     }
 
@@ -858,12 +891,7 @@ static void handle_ctype_005(const char *gw_sn, cJSON *data, int msg_id)
         app_tuya_bridge_update_position(dev_sn, (uint8_t)position);
     }
     if (voltage >= 0) {
-        /* 电压原始值 → 百分比 */
-        uint8_t percent = 0;
-        if (voltage <= BATTERY_RAW_MIN) percent = 0;
-        else if (voltage >= BATTERY_RAW_MAX) percent = 100;
-        else percent = (uint8_t)((voltage - BATTERY_RAW_MIN) * 100 / (BATTERY_RAW_MAX - BATTERY_RAW_MIN));
-        app_tuya_bridge_update_battery(dev_sn, percent);
+        app_tuya_bridge_update_battery(dev_sn, voltage_to_percent(voltage));
     }
     /* 风锁模式 DP 上报 */
     if (wind_lock_mode >= 0) {
@@ -872,6 +900,46 @@ static void handle_ctype_005(const char *gw_sn, cJSON *data, int msg_id)
 }
 
 /* ==================== MQTT 消息解析与分发 ==================== */
+
+/**
+ * @brief 从 MQTT 主题提取网关 SN 并自动注册
+ *
+ * 主题格式：gateway/<sn>/rpt 或 gateway/<sn>/req
+ * 收到任意网关主题消息即自动注册该网关，无需显式 001 绑定。
+ *
+ * @param topic MQTT 主题
+ * @return true 如果成功从主题提取并注册了网关
+ */
+static bool auto_discover_gateway_from_topic(const char *topic)
+{
+    if (topic == NULL) return false;
+
+    /* 主题格式：gateway/<sn>/rpt 或 gateway/<sn>/req
+     * 前缀 "gateway/" = 8 字符 */
+    const char *prefix = "gateway/";
+    size_t prefix_len = 8;
+
+    if (strncmp(topic, prefix, prefix_len) != 0) return false;
+
+    const char *sn_start = topic + prefix_len;
+    const char *slash = strchr(sn_start, '/');
+    if (slash == NULL || slash == sn_start) return false;
+
+    /* 提取 SN（跳过 rpt_rsp 等非 SN 主题）*/
+    size_t sn_len = (size_t)(slash - sn_start);
+    if (sn_len == 0 || sn_len >= 32) return false;
+
+    /* 排除 "rpt_rsp" 等保留主题（sn 部分为 "rpt_rsp"）*/
+    if (sn_len == 7 && strncmp(sn_start, "rpt_rsp", 7) == 0) return false;
+
+    /* 提取并注册网关 */
+    char gw_sn[32];
+    memcpy(gw_sn, sn_start, sn_len);
+    gw_sn[sn_len] = '\0';
+
+    register_gateway(gw_sn);
+    return true;
+}
 
 static void handle_mqtt_message(const mqtt_message_t *msg)
 {
@@ -884,6 +952,14 @@ static void handle_mqtt_message(const mqtt_message_t *msg)
 
     PR_DEBUG("收到 MQTT: topic=%s data=%.*s", msg->topic, msg->data_len, msg->data);
     app_led_flash(LED_GREEN);
+
+    /* 网关自动发现：从主题提取网关 SN 并自动注册
+     * 即使 JSON 解析失败或非 $SH 协议，只要消息来自 gateway/<sn>/rpt 主题，
+     * 就自动注册该网关。无需网关显式发送 001 绑定。*/
+    bool gw_discovered = auto_discover_gateway_from_topic(msg->topic);
+    if (gw_discovered) {
+        PR_DEBUG("网关自动发现: topic=%s", msg->topic);
+    }
 
     cJSON *root = cJSON_ParseWithLength(msg->data, msg->data_len);
     if (root == NULL) {
@@ -964,6 +1040,7 @@ static void on_mqtt_connected(void *client, void *userdata)
     mutex_lock(s_mqtt_client_mutex);
     s_mqtt_client_connected = true;
     mutex_unlock(s_mqtt_client_mutex);
+    app_led_set(LED_GREEN, LED_MODE_ON, 0);
     PR_INFO("本地 MQTT 客户端已连接（TuyaOpen libmqtt）");
 }
 
@@ -976,6 +1053,7 @@ static void on_mqtt_disconnected(void *client, void *userdata)
     mutex_lock(s_mqtt_client_mutex);
     s_mqtt_client_connected = false;
     mutex_unlock(s_mqtt_client_mutex);
+    app_led_off(LED_GREEN);
     PR_WARN("本地 MQTT 客户端断开，将自动重连");
 }
 
@@ -1045,9 +1123,25 @@ static int on_broker_connect(const char *client_id, const char *username,
         return -1;
     }
 
-    PR_DEBUG("Broker 连接: client=%s user=%s",
-             client_id ? client_id : "(null)",
-             username ? username : "(anonymous)");
+    /* 认证检查 */
+    if (s_enable_broker_auth) {
+        if (username == NULL || strcmp(username, BROKER_USERNAME) != 0) {
+            PR_WARN("Broker 认证失败（用户名不匹配）: client=%s user=%s",
+                    client_id ? client_id : "(null)",
+                    username ? username : "(null)");
+            return -1;
+        }
+        if (password == NULL || password_len != (int)strlen(s_broker_password) ||
+            memcmp(password, s_broker_password, password_len) != 0) {
+            PR_WARN("Broker 认证失败（密码不匹配）: client=%s", client_id ? client_id : "(null)");
+            return -1;
+        }
+        PR_DEBUG("Broker 认证成功: client=%s user=%s", client_id, username);
+    } else {
+        PR_DEBUG("Broker 连接（无认证）: client=%s user=%s",
+                 client_id ? client_id : "(null)",
+                 username ? username : "(anonymous)");
+    }
 
     return 0; /* 接受连接 */
 }
@@ -1066,10 +1160,32 @@ static void mqtt_client_task(void *arg)
 {
     PR_INFO("MQTT 客户端 task 已启动");
 
+    uint32_t backoff_ms = MQTT_BACKOFF_MIN_MS;
+    int consecutive_failures = 0;
+    uint32_t circuit_breaker_until_ms = 0;
+
     while (s_mqtt_client_should_run) {
         if (s_mqtt_client == NULL) {
             tal_system_sleep(1000);
             continue;
+        }
+
+        /* 熔断器检查 */
+        uint32_t now = (uint32_t)tal_system_get_millisecond();
+        if (consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD) {
+            if (circuit_breaker_until_ms == 0) {
+                circuit_breaker_until_ms = now + CIRCUIT_BREAKER_COOLDOWN_MS;
+                PR_WARN("熔断器触发：连续失败 %d 次，冷却 %dms",
+                        consecutive_failures, CIRCUIT_BREAKER_COOLDOWN_MS);
+            }
+            if (now < circuit_breaker_until_ms) {
+                tal_system_sleep(1000);
+                continue;
+            }
+            PR_INFO("熔断器冷却完成，重置退避");
+            consecutive_failures = 0;
+            backoff_ms = MQTT_BACKOFF_MIN_MS;
+            circuit_breaker_until_ms = 0;
         }
 
         /* 检查是否已连接 */
@@ -1082,10 +1198,19 @@ static void mqtt_client_task(void *arg)
             PR_INFO("MQTT 客户端正在连接 127.0.0.1:1883...");
             mqtt_client_status_t status = mqtt_client_connect(s_mqtt_client);
             if (status != MQTT_STATUS_SUCCESS) {
-                PR_WARN("MQTT 连接失败: %d，%dms 后重试", status, MQTT_RECONNECT_DELAY_MS);
-                tal_system_sleep(MQTT_RECONNECT_DELAY_MS);
+                consecutive_failures++;
+                PR_WARN("MQTT 连接失败: %d（第 %d 次），指数退避 %dms",
+                        status, consecutive_failures, backoff_ms);
+                tal_system_sleep(backoff_ms);
+                /* 指数退避 */
+                backoff_ms *= MQTT_BACKOFF_FACTOR;
+                if (backoff_ms > MQTT_BACKOFF_MAX_MS) backoff_ms = MQTT_BACKOFF_MAX_MS;
                 continue;
             }
+            /* 连接成功，重置退避 */
+            consecutive_failures = 0;
+            backoff_ms = MQTT_BACKOFF_MIN_MS;
+            circuit_breaker_until_ms = 0;
         }
 
         /* 处理 MQTT 网络事件（接收 PUBACK、保持连接等） */
@@ -1159,6 +1284,13 @@ int app_protocol_bridge_init(const protocol_bridge_config_t *config)
     strncpy(s_bridge_sn, config->bridge_sn, sizeof(s_bridge_sn) - 1);
     s_bridge_sn[sizeof(s_bridge_sn) - 1] = '\0';
 
+    /* Broker 认证配置 */
+    s_enable_broker_auth = config->enable_broker_auth;
+    if (s_enable_broker_auth) {
+        derive_broker_password();
+        PR_INFO("Broker 认证已启用: user=%s", BROKER_USERNAME);
+    }
+
     /* 创建互斥锁 */
     if (s_mqtt_client_mutex == NULL) tal_mutex_create_init(&s_mqtt_client_mutex);
     if (s_command_id_mutex == NULL) tal_mutex_create_init(&s_command_id_mutex);
@@ -1187,8 +1319,8 @@ int app_protocol_bridge_init(const protocol_bridge_config_t *config)
         .keepalive = 60,
         .timeout_ms = 5000,
         .clientid = s_bridge_sn,
-        .username = NULL,
-        .password = NULL,
+        .username = s_enable_broker_auth ? BROKER_USERNAME : NULL,
+        .password = s_enable_broker_auth ? s_broker_password : NULL,
         .cacert = NULL,
         .cacert_len = 0,
         .userdata = NULL,

@@ -189,10 +189,18 @@ void user_upgrade_notify_on(tuya_iot_client_t *client, cJSON *upgrade)
     cJSON *version_item = cJSON_GetObjectItem(upgrade, "version");
     cJSON *size_item    = cJSON_GetObjectItem(upgrade, "size");
     cJSON *type_item    = cJSON_GetObjectItem(upgrade, "type");
+    cJSON *url_item     = cJSON_GetObjectItem(upgrade, "url");
+    cJSON *md5_item     = cJSON_GetObjectItem(upgrade, "md5");
 
     PR_INFO("版本: %s", cJSON_IsString(version_item) ? version_item->valuestring : "N/A");
-    PR_INFO("大小: %s", cJSON_IsString(size_item) ? size_item->valuestring : "N/A");
-    PR_INFO("通道: %d", cJSON_IsNumber(type_item) ? type_item->valueint : -1);
+    PR_INFO("大小: %s bytes", cJSON_IsString(size_item) ? size_item->valuestring : "N/A");
+    PR_INFO("通道: %d (%s)", cJSON_IsNumber(type_item) ? type_item->valueint : -1,
+            (cJSON_IsNumber(type_item) && type_item->valueint == 0) ? "固件" : "模块");
+    PR_INFO("URL:  %s", cJSON_IsString(url_item) ? url_item->valuestring : "N/A");
+    PR_INFO("MD5:  %s", cJSON_IsString(md5_item) ? md5_item->valuestring : "N/A");
+
+    /* 红灯快闪表示 OTA 进行中 */
+    app_led_set(LED_RED, LED_MODE_FAST_BLINK, 0);
 }
 
 /* ==================== TuyaOpen 事件处理器 ==================== */
@@ -461,6 +469,7 @@ void user_main(void)
 
     protocol_bridge_config_t bridge_config = {
         .bridge_sn = bridge_sn,
+        .enable_broker_auth = true,  /* 启用 Broker 用户名/密码认证 */
     };
     app_protocol_bridge_init(&bridge_config);
 

@@ -47,11 +47,24 @@ extern "C" {
 /** 每个设备的 DP 数量 */
 #define DP_PER_DEVICE           4
 
+/** 设备哈希表大小（2 的幂次，> MAX_TUYA_DEVICES）*/
+#define DEVICE_HASH_SIZE        32
+
 /** 支持 wind_lock 功能的设备 SN 前缀（内倒/平开模式），参考 const.py DEVICE_SN_PREFIX_WIND_LOCK */
 #define WIND_LOCK_SN_PREFIX     "5005"
 
 /** SN 前缀长度 */
 #define WIND_LOCK_SN_PREFIX_LEN 4
+
+/* ==================== 设备生命周期状态机 ==================== */
+
+typedef enum {
+    DEV_STATE_IDLE        = 0,    /**< 未注册 */
+    DEV_STATE_REGISTERING = 1,    /**< 正在注册 DP */
+    DEV_STATE_ONLINE      = 2,    /**< 在线 */
+    DEV_STATE_OFFLINE     = 3,    /**< 离线（网关超时） */
+    DEV_STATE_REMOVING    = 4,    /**< 正在解绑 */
+} device_state_t;
 
 /* ==================== DP 偏移量定义 ==================== */
 
@@ -156,6 +169,25 @@ void app_tuya_bridge_update_wind_lock(const char *device_sn, uint8_t mode);
  * @param online true=在线, false=离线
  */
 void app_tuya_bridge_update_online(const char *device_sn, bool online);
+
+/**
+ * @brief 批量上报位置+电池 DP（减少网络开销）
+ *
+ * 将位置和电池合并为一次 tuya_iot_dp_obj_report 调用。
+ *
+ * @param device_sn LoRa 设备 SN
+ * @param position 位置值 0-100（<0 表示不更新）
+ * @param battery 电池百分比 0-100（<0 表示不更新）
+ */
+void app_tuya_bridge_update_status_batch(const char *device_sn, int16_t position, int16_t battery);
+
+/**
+ * @brief 获取设备当前状态
+ *
+ * @param device_sn LoRa 设备 SN
+ * @return 设备状态枚举值，DEV_STATE_IDLE 表示未注册
+ */
+device_state_t app_tuya_bridge_get_state(const char *device_sn);
 
 /**
  * @brief 检查设备是否支持风锁模式（内倒/平开）

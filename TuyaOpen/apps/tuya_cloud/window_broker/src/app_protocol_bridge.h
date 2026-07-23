@@ -41,6 +41,19 @@ extern "C" {
 /** 网关离线超时（秒），参考 HA 集成 GATEWAY_TIMEOUT_SECONDS */
 #define GATEWAY_OFFLINE_TIMEOUT_SEC 900
 
+/* ==================== 统一错误码 ==================== */
+
+typedef enum {
+    BRIDGE_OK              = 0,    /**< 成功 */
+    BRIDGE_ERR_PARAM      = -1,    /**< 参数无效 */
+    BRIDGE_ERR_NOMEM      = -2,    /**< 内存不足 */
+    BRIDGE_ERR_NOT_FOUND  = -3,    /**< 未找到 */
+    BRIDGE_ERR_TABLE_FULL = -4,    /**< 表已满 */
+    BRIDGE_ERR_AUTH       = -5,    /**< 认证失败 */
+    BRIDGE_ERR_TIMEOUT    = -6,    /**< 超时 */
+    BRIDGE_ERR_PROTOCOL   = -7,    /**< 协议错误 */
+} bridge_err_t;
+
 /* ==================== 数据结构 ==================== */
 
 /**
@@ -48,6 +61,7 @@ extern "C" {
  */
 typedef struct {
     const char *bridge_sn;          /**< 本桥接器的序列号（用于 001 响应的 uuid 字段，建议用 MAC 地址） */
+    bool enable_broker_auth;        /**< 是否启用 Broker 认证（true=要求用户名/密码，false=允许匿名） */
 } protocol_bridge_config_t;
 
 /* ==================== API 函数 ==================== */
