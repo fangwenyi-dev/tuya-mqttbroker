@@ -1,0 +1,9 @@
+# TuyaOpen Bridge 烧录工具 Python 依赖
+# 安装命令：pip install -r requirements.txt
+
+pyserial>=3.5
+qrcode[pil]>=7.4
+Pillow>=9.0
+pywin32>=305
+esptool>=4.7
+pyinstaller>=6.0

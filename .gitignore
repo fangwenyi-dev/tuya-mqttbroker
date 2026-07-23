@@ -1,0 +1,94 @@
+# ============================================================
+# TuyaOpen MQTT Broker 项目 - Git 忽略规则
+# ============================================================
+
+# ---- TuyaOpen SDK 大文件（不需提交，用户自行克隆）----
+TuyaOpen/.git/
+TuyaOpen/.venv/
+TuyaOpen/.tools/
+TuyaOpen/.cache/
+TuyaOpen/platform/
+TuyaOpen/src/
+TuyaOpen/boards/
+TuyaOpen/docs/
+TuyaOpen/examples/
+TuyaOpen/tests/
+TuyaOpen/tools/
+TuyaOpen/.github/
+TuyaOpen/compile_commands.json
+TuyaOpen/uv.lock
+TuyaOpen/uv-manifest.env
+
+# ---- 只保留 window_broker 应用，忽略其他 apps ----
+TuyaOpen/apps/games/
+TuyaOpen/apps/micropython/
+TuyaOpen/apps/mimiclaw/
+TuyaOpen/apps/tuya.ai/
+TuyaOpen/apps/tuya_t5_pixel/
+TuyaOpen/apps/tuya_t5_pocket/
+TuyaOpen/apps/tuya_cloud/switch_demo/
+TuyaOpen/apps/tuya_cloud/ai_chat/
+TuyaOpen/apps/tuya_cloud/bt_mesh/
+TuyaOpen/apps/tuya_cloud/mcu/
+TuyaOpen/apps/tuya_cloud/camera_demo/
+TuyaOpen/apps/tuya_cloud/ultra_lowpower_demo/
+TuyaOpen/apps/tuya_cloud/weather_get_demo/
+TuyaOpen/apps/tuya_cloud/README.md
+TuyaOpen/apps/tuya_cloud/README_zh.md
+
+# ---- 构建产物 ----
+build/
+.build/
+dist/
+*.o
+*.obj
+*.elf
+*.bin
+*.map
+*.a
+*.lib
+build_log*.txt
+export_log.txt
+pip_cmake_log.txt
+uv_install_log.txt
+uv_sync_log.txt
+uv_yaml_log.txt
+
+# ---- 烧录工具构建产物 ----
+flash/dist/
+flash/build/
+flash/__pycache__/
+flash/settings.json
+
+# ---- 授权信息（严禁提交）----
+**/tuya_config_secrets.h
+
+# ---- 源代码参考目录 ----
+源代码/
+
+# ---- IDE / 编辑器 ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.clangd
+.cache/
+
+# ---- 系统文件 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- TuyaOpen 构建缓存 ----
+.dep/
+
+# ---- ESP-IDF managed_components（自动下载）----
+**/managed_components/
+
+# ---- mosquitto 组件中的示例和测试（不需要）----
+TuyaOpen/apps/tuya_cloud/window_broker/esp_components/espressif__mosquitto/examples/
+TuyaOpen/apps/tuya_cloud/window_broker/esp_components/espressif__mosquitto/test/
+
+# ---- uploads ----
+.uploads/
