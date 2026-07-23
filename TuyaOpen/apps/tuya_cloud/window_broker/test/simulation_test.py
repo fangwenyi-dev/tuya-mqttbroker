@@ -772,6 +772,149 @@ result.assert_eq(len(queue), MQTT_MSG_QUEUE_SIZE, "队列满后添加不超限")
 result.assert_true("msg_0" not in queue, "最早的 msg_0 被丢弃")
 result.assert_true("msg_10" in queue, "最新的 msg_10 在队列中")
 
+# ---------- 测试 21: mDNS 主机名配置 ----------
+print("\n📋 测试 21: mDNS 主机名配置验证")
+print("-" * 40)
+
+main_file = os.path.join(os.path.dirname(__file__), '..', 'src', 'tuya_main.c')
+if os.path.exists(main_file):
+    with open(main_file, 'r', encoding='utf-8') as f:
+        main_code = f.read()
+
+    # 验证 mDNS 相关定义
+    has_mdns_include = '#include "mdns.h"' in main_code
+    has_mdns_hostname = 'MDNS_HOSTNAME' in main_code and 'matter-broker' in main_code
+    has_mdns_service = '_mqtt' in main_code and '_tcp' in main_code
+    has_mdns_port = '1883' in main_code
+    has_mdns_init_flag = 's_mdns_initialized' in main_code
+    has_mdns_setup_func = 'setup_mdns_service' in main_code
+    has_mdns_call = 'setup_mdns_service();' in main_code
+
+    # 验证 mDNS 在 TUYA_EVENT_DIRECT_MQTT_CONNECTED 中调用
+    mqtt_connected_section = main_code.split('TUYA_EVENT_DIRECT_MQTT_CONNECTED')[1].split('break;')[0] if 'TUYA_EVENT_DIRECT_MQTT_CONNECTED' in main_code else ''
+    has_mdns_in_event = 'setup_mdns_service' in mqtt_connected_section
+
+    result.assert_true(has_mdns_include, "tuya_main.c 包含 mdns.h")
+    result.assert_true(has_mdns_hostname, "mDNS 主机名定义为 matter-broker")
+    result.assert_true(has_mdns_service, "mDNS 服务类型为 _mqtt._tcp")
+    result.assert_true(has_mdns_port, "mDNS 服务端口为 1883")
+    result.assert_true(has_mdns_init_flag, "mDNS 初始化标志存在")
+    result.assert_true(has_mdns_setup_func, "setup_mdns_service() 函数已定义")
+    result.assert_true(has_mdns_call, "setup_mdns_service() 在事件处理器中被调用")
+    result.assert_true(has_mdns_in_event, "mDNS 在 TUYA_EVENT_DIRECT_MQTT_CONNECTED 事件中初始化")
+else:
+    print("  ⚠️ tuya_main.c 未找到，跳过此测试")
+
+# ---------- 测试 22: mDNS 一次性初始化保护 ----------
+print("\n📋 测试 22: mDNS 一次性初始化保护")
+print("-" * 40)
+
+if os.path.exists(main_file):
+    with open(main_file, 'r', encoding='utf-8') as f:
+        main_code = f.read()
+
+    # 验证 setup_mdns_service 函数中有 s_mdns_initialized 检查
+    # 获取完整函数体（从函数签名到下一个章节标记）
+    setup_func_section = main_code.split('setup_mdns_service(void)')[1].split('用户日志输出回调')[0] if 'setup_mdns_service(void)' in main_code else ''
+    has_early_return = 'if (s_mdns_initialized)' in setup_func_section
+    has_set_flag = 's_mdns_initialized = true' in setup_func_section
+
+    result.assert_true(has_early_return, "setup_mdns_service 入口检查 s_mdns_initialized 避免重复初始化")
+    result.assert_true(has_set_flag, "setup_mdns_service 成功后设置 s_mdns_initialized = true")
+else:
+    print("  ⚠️ tuya_main.c 未找到，跳过此测试")
+
+# ---------- 测试 23: CMakeLists mDNS include 路径 ----------
+print("\n📋 测试 23: CMakeLists.txt mDNS include 路径")
+print("-" * 40)
+
+cmake_file = os.path.join(os.path.dirname(__file__), '..', 'CMakeLists.txt')
+if os.path.exists(cmake_file):
+    with open(cmake_file, 'r', encoding='utf-8') as f:
+        cmake_code = f.read()
+
+    has_mdns_include = 'mdns/include' in cmake_code
+    result.assert_true(has_mdns_include, "CMakeLists.txt 包含 mdns include 路径")
+else:
+    print("  ⚠️ CMakeLists.txt 未找到，跳过此测试")
+
+# ---------- 测试 24: 烧录工具授权码功能 ----------
+print("\n📋 测试 24: 烧录工具授权码写入功能")
+print("-" * 40)
+
+flash_tool_file = os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', '..', 'flash', 'flash_tool.py')
+if os.path.exists(flash_tool_file):
+    with open(flash_tool_file, 'r', encoding='utf-8') as f:
+        flash_code = f.read()
+
+    # 验证 GUI 元素
+    has_uuid_var = 'auth_uuid_var' in flash_code
+    has_key_var = 'auth_key_var' in flash_code
+    has_write_btn = 'write_auth_btn' in flash_code
+    has_erase_btn = 'erase_auth_btn' in flash_code
+    has_write_handler = '_on_write_auth' in flash_code
+    has_erase_handler = '_on_erase_auth' in flash_code
+    has_thread_func = '_write_auth_thread_func' in flash_code
+
+    # 验证 CLI 命令格式
+    has_auth_cmd = 'auth {uuid_val} {key_val}' in flash_code
+    has_erase_cmd = 'auth erase' in flash_code
+
+    # 验证安全：AuthKey 不保存到配置文件
+    has_no_key_save = '# AuthKey 不保存到配置文件' in flash_code
+    has_no_key_load = '# AuthKey 不从配置文件加载' in flash_code
+
+    # 验证版本升级
+    has_v13 = 'v1.3' in flash_code
+
+    # 验证 AuthKey 输入框有掩码
+    has_mask = 'show="*"' in flash_code
+
+    result.assert_true(has_uuid_var, "烧录工具有 UUID 输入变量")
+    result.assert_true(has_key_var, "烧录工具有 AuthKey 输入变量")
+    result.assert_true(has_write_btn, "烧录工具有写入授权码按钮")
+    result.assert_true(has_erase_btn, "烧录工具有擦除授权码按钮")
+    result.assert_true(has_write_handler, "烧录工具有写入授权码处理函数")
+    result.assert_true(has_erase_handler, "烧录工具有擦除授权码处理函数")
+    result.assert_true(has_thread_func, "烧录工具有授权码写入线程函数")
+    result.assert_true(has_auth_cmd, "写入命令格式为 auth <uuid> <authkey>")
+    result.assert_true(has_erase_cmd, "擦除命令格式为 auth erase")
+    result.assert_true(has_no_key_save, "AuthKey 不保存到配置文件（安全）")
+    result.assert_true(has_no_key_load, "AuthKey 不从配置文件加载（安全）")
+    result.assert_true(has_v13, "烧录工具版本升级到 v1.3")
+    result.assert_true(has_mask, "AuthKey 输入框有掩码保护")
+else:
+    print("  ⚠️ flash_tool.py 未找到，跳过此测试")
+
+# ---------- 测试 25: 烧录工具串口安全 ----------
+print("\n📋 测试 25: 烧录工具串口安全处理")
+print("-" * 40)
+
+if os.path.exists(flash_tool_file):
+    with open(flash_tool_file, 'r', encoding='utf-8') as f:
+        flash_code = f.read()
+
+    # 验证写入前停止监控
+    write_section = flash_code.split('_on_write_auth(self):')[1].split('def ')[0] if '_on_write_auth(self):' in flash_code else ''
+    has_stop_monitor_before_write = '_stop_monitor' in write_section
+    has_is_flashing_check = '_is_flashing' in write_section
+
+    # 验证串口在 finally 中关闭
+    thread_section = flash_code.split('_write_auth_thread_func(self, port, uuid_val, key_val, erase):')[1].split('def ')[0] if '_write_auth_thread_func' in flash_code else ''
+    has_finally_close = 'ser.close()' in thread_section
+    has_baudrate = 'MONITOR_BAUDRATE' in thread_section
+
+    # 验证按钮状态管理
+    has_auth_btn_state = '_set_auth_buttons_state' in flash_code
+
+    result.assert_true(has_stop_monitor_before_write, "写入授权码前停止监控释放串口")
+    result.assert_true(has_is_flashing_check, "写入授权码前检查烧录状态")
+    result.assert_true(has_finally_close, "授权码线程 finally 中关闭串口")
+    result.assert_true(has_baudrate, "使用 MONITOR_BAUDRATE 通信")
+    result.assert_true(has_auth_btn_state, "有授权码按钮状态管理函数")
+else:
+    print("  ⚠️ flash_tool.py 未找到，跳过此测试")
+
 # ==================== 结果汇总 ====================
 
 success = result.summary()

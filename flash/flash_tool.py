@@ -77,8 +77,8 @@ except ImportError:
 # 全局常量
 # ====================================================================
 APP_TITLE = "TuyaOpen Bridge 烧录工具"
-APP_VERSION = "v1.2"
-WINDOW_SIZE = "900x700"
+APP_VERSION = "v1.3"
+WINDOW_SIZE = "900x780"
 
 # 固件清单文件名（TuyaOpen/ESP-IDF build 生成）
 FLASH_ARGS_FILE = "flasher_args.json"
@@ -196,6 +196,10 @@ class FlashToolApp:
         self.mt_code_var = tk.StringVar(value="等待设备输出二维码...")
         self.manual_code_var = tk.StringVar(value="")
 
+        # 授权码
+        self.auth_uuid_var = tk.StringVar(value="")
+        self.auth_key_var = tk.StringVar(value="")
+
         # 线程与运行控制
         self._flash_thread = None
         self._monitor_thread = None
@@ -208,6 +212,7 @@ class FlashToolApp:
         self._current_pil_image = None     # 当前 PIL 图像（用于打印/保存）
         self._last_saved_mt_code = None    # 上次自动保存的 MT 码（避免重复保存）
         self._saved_port = None            # 从配置文件加载的串口名，扫描后匹配
+        self._auth_thread = None             # 授权码写入线程
 
         # ---------- 加载设置 ----------
         self._load_settings()
@@ -347,6 +352,49 @@ class FlashToolApp:
         # 状态标签
         self.status_label = ttk.Label(left_frame, text="状态: 就绪", foreground="blue")
         self.status_label.grid(row=row, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        row += 1
+
+        # ---- 授权码写入区 ----
+        ttk.Separator(left_frame, orient="horizontal").grid(
+            row=row, column=0, columnspan=2, sticky="ew", pady=10
+        )
+        row += 1
+
+        ttk.Label(left_frame, text="授权码写入", font=("微软雅黑", 10, "bold")).grid(
+            row=row, column=0, columnspan=2, sticky="w"
+        )
+        row += 1
+
+        ttk.Label(left_frame, text="UUID:").grid(row=row, column=0, sticky="w", pady=2)
+        self.uuid_entry = ttk.Entry(left_frame, textvariable=self.auth_uuid_var)
+        self.uuid_entry.grid(row=row, column=1, sticky="ew", pady=2)
+        row += 1
+
+        ttk.Label(left_frame, text="AuthKey:").grid(row=row, column=0, sticky="w", pady=2)
+        self.authkey_entry = ttk.Entry(left_frame, textvariable=self.auth_key_var, show="*")
+        self.authkey_entry.grid(row=row, column=1, sticky="ew", pady=2)
+        row += 1
+
+        auth_btn_frame = ttk.Frame(left_frame)
+        auth_btn_frame.grid(row=row, column=0, columnspan=2, sticky="ew", pady=3)
+        auth_btn_frame.columnconfigure(0, weight=1)
+        auth_btn_frame.columnconfigure(1, weight=1)
+        self.write_auth_btn = ttk.Button(
+            auth_btn_frame, text="写入授权码", command=self._on_write_auth
+        )
+        self.write_auth_btn.grid(row=0, column=0, sticky="ew", padx=2)
+        self.erase_auth_btn = ttk.Button(
+            auth_btn_frame, text="擦除授权码", command=self._on_erase_auth
+        )
+        self.erase_auth_btn.grid(row=0, column=1, sticky="ew", padx=2)
+        row += 1
+
+        ttk.Label(
+            left_frame,
+            text="提示: 写入后需重启设备生效\n设备需已烧录固件并连接串口",
+            font=("微软雅黑", 8),
+            foreground="gray"
+        ).grid(row=row, column=0, columnspan=2, sticky="w", pady=2)
 
     def _build_right_qrcode_frame(self, parent):
         """构建右侧二维码区。"""
@@ -481,6 +529,191 @@ class FlashToolApp:
         if " - " in text:
             return text.split(" - ")[0].strip()
         return text.strip()
+
+    # ================================================================
+    # 授权码写入
+    # ================================================================
+    def _on_write_auth(self):
+        """写入授权码按钮回调。"""
+        uuid_val = self.auth_uuid_var.get().strip()
+        key_val = self.auth_key_var.get().strip()
+
+        if not uuid_val or not key_val:
+            messagebox.showerror("错误", "请输入 UUID 和 AuthKey！")
+            return
+        if len(uuid_val) < 8 or len(key_val) < 8:
+            messagebox.showerror("错误", "UUID 和 AuthKey 长度不足，请检查输入！")
+            return
+
+        port = self._get_selected_port_name()
+        if not port:
+            messagebox.showerror("错误", "请先选择串口！")
+            return
+
+        # 停止监控以释放串口
+        if self._is_monitoring:
+            self._stop_monitor(wait_thread=True)
+            time.sleep(0.3)
+
+        if self._is_flashing:
+            messagebox.showwarning("提示", "烧录正在进行中，请等待完成。")
+            return
+
+        self._log("=" * 50, TAG_INFO)
+        self._log(f"开始写入授权码 | 端口={port} | UUID={uuid_val[:8]}...", TAG_INFO)
+        self._log("=" * 50, TAG_INFO)
+
+        self._set_auth_buttons_state(False)
+        self._update_status("写入授权码中...", "blue")
+
+        self._auth_thread = threading.Thread(
+            target=self._write_auth_thread_func,
+            args=(port, uuid_val, key_val, False),
+            daemon=True
+        )
+        self._auth_thread.start()
+
+    def _on_erase_auth(self):
+        """擦除授权码按钮回调。"""
+        port = self._get_selected_port_name()
+        if not port:
+            messagebox.showerror("错误", "请先选择串口！")
+            return
+
+        # 停止监控以释放串口
+        if self._is_monitoring:
+            self._stop_monitor(wait_thread=True)
+            time.sleep(0.3)
+
+        if self._is_flashing:
+            messagebox.showwarning("提示", "烧录正在进行中，请等待完成。")
+            return
+
+        result = messagebox.askyesno(
+            "确认",
+            "确定要擦除设备中的授权码吗？\n\n擦除后设备将使用 tuya_config.h 中的默认值。",
+            icon="warning"
+        )
+        if not result:
+            return
+
+        self._log("开始擦除授权码...", TAG_INFO)
+        self._set_auth_buttons_state(False)
+        self._update_status("擦除授权码中...", "blue")
+
+        self._auth_thread = threading.Thread(
+            target=self._write_auth_thread_func,
+            args=(port, "", "", True),
+            daemon=True
+        )
+        self._auth_thread.start()
+
+    def _write_auth_thread_func(self, port, uuid_val, key_val, erase):
+        """授权码写入线程函数：通过串口发送 CLI 命令。"""
+        if not SERIAL_AVAILABLE:
+            self._log("pyserial 未安装，无法写入授权码", TAG_ERROR)
+            self._update_status("写入失败", "red")
+            self._set_auth_buttons_state(True)
+            return
+
+        try:
+            ser = serial.Serial(
+                port,
+                baudrate=MONITOR_BAUDRATE,
+                timeout=2,
+                write_timeout=2
+            )
+            self._log(f"串口 {port} 已打开", TAG_SUCCESS)
+
+            # 等待设备就绪
+            time.sleep(0.5)
+
+            # 清空接收缓冲
+            if ser.in_waiting > 0:
+                ser.read(ser.in_waiting)
+
+            if erase:
+                # 擦除授权码：发送 auth erase 命令
+                cmd = "auth erase\n"
+                self._log(f"发送命令: {cmd.strip()}", TAG_INFO)
+                ser.write(cmd.encode("utf-8"))
+            else:
+                # 写入授权码：发送 auth <uuid> <authkey> 命令
+                cmd = f"auth {uuid_val} {key_val}\n"
+                self._log(f"发送命令: auth {uuid_val[:8]}... {key_val[:4]}****", TAG_INFO)
+                ser.write(cmd.encode("utf-8"))
+
+            # 读取响应（等待最多 5 秒）
+            time.sleep(1.0)
+            response = b""
+            deadline = time.time() + 5.0
+            while time.time() < deadline:
+                if ser.in_waiting > 0:
+                    chunk = ser.read(ser.in_waiting)
+                    response += chunk
+                    # 检查是否收到完整响应
+                    if b"\n" in response:
+                        break
+                else:
+                    time.sleep(0.1)
+
+            # 解析响应
+            resp_text = response.decode("utf-8", errors="replace").strip()
+            if resp_text:
+                for line in resp_text.split("\n"):
+                    line = line.strip()
+                    if line:
+                        self._log(f"设备响应: {line}", TAG_SERIAL)
+
+            # 判断结果
+            resp_lower = resp_text.lower()
+            if "ok" in resp_lower or "success" in resp_lower or "saved" in resp_lower:
+                if erase:
+                    self._log("授权码擦除成功！", TAG_SUCCESS)
+                    self._update_status("擦除成功", "green")
+                else:
+                    self._log("授权码写入成功！请重启设备生效。", TAG_SUCCESS)
+                    self._update_status("写入成功", "green")
+                    # 提示重启
+                    self.root.after(0, lambda: messagebox.showinfo(
+                        "成功",
+                        "授权码写入成功！\n\n请断电重启设备（或长按 5 秒重置）使授权码生效。"
+                    ))
+            elif not resp_text:
+                self._log("未收到设备响应，请确认设备已启动且串口正确", TAG_ERROR)
+                self._update_status("无响应", "red")
+            else:
+                # 即使没有明确的成功标识，命令已发送
+                if erase:
+                    self._log("擦除命令已发送（未收到明确确认，请查看设备日志）", TAG_INFO)
+                    self._update_status("已发送", "blue")
+                else:
+                    self._log("写入命令已发送（未收到明确确认，请查看设备日志）", TAG_INFO)
+                    self._update_status("已发送", "blue")
+
+        except serial.SerialException as e:
+            self._log(f"串口错误: {e}", TAG_ERROR)
+            self._update_status("写入失败", "red")
+        except Exception as e:
+            self._log(f"写入授权码异常: {e}", TAG_ERROR)
+            self._update_status("写入失败", "red")
+        finally:
+            try:
+                if 'ser' in locals() and ser.is_open:
+                    ser.close()
+            except Exception:
+                pass
+            self._set_auth_buttons_state(True)
+            self._log("串口已释放", TAG_INFO)
+
+    def _set_auth_buttons_state(self, enabled):
+        """启用/禁用授权码按钮。"""
+        try:
+            state = tk.NORMAL if enabled else tk.DISABLED
+            self.root.after(0, lambda s=state: self.write_auth_btn.config(state=s))
+            self.root.after(0, lambda s=state: self.erase_auth_btn.config(state=s))
+        except Exception:
+            pass
 
     # ================================================================
     # 目录浏览
@@ -1124,6 +1357,9 @@ class FlashToolApp:
                     self.erase_var.set(bool(data["erase"]))
                 if "auto_monitor" in data:
                     self.auto_monitor_var.set(bool(data["auto_monitor"]))
+                if "auth_uuid" in data:
+                    self.auth_uuid_var.set(data["auth_uuid"])
+                # AuthKey 不从配置文件加载（安全考虑）
         except (OSError, json.JSONDecodeError) as e:
             # 加载失败不致命
             print(f"加载设置失败: {e}")
@@ -1142,6 +1378,8 @@ class FlashToolApp:
                 "firmware_dir": self.firmware_dir_var.get(),
                 "erase": bool(self.erase_var.get()),
                 "auto_monitor": bool(self.auto_monitor_var.get()),
+                "auth_uuid": self.auth_uuid_var.get().strip(),
+                # AuthKey 不保存到配置文件（安全考虑）
             }
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)

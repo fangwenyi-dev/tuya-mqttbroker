@@ -42,6 +42,11 @@
 #include "tkl_wifi.h"
 #include <assert.h>
 
+/* ESP-IDF mDNS（用于 matter-broker.local 局域网寻址） */
+#if !defined(PLATFORM_UBUNTU) || (PLATFORM_UBUNTU == 0)
+#include "mdns.h"
+#endif
+
 #if defined(ENABLE_WIFI) && (ENABLE_WIFI == 1)
 #include "netconn_wifi.h"
 #endif
@@ -67,6 +72,14 @@
 /* 按键 GPIO */
 #define BUTTON_GPIO_NUM     0       /* BOOT 按键（GPIO0，低电平有效） */
 
+/* ==================== mDNS 配置 ==================== */
+
+/* mDNS 主机名（与 Matter 方案统一，LoRa 网关可用 matter-broker.local 寻址） */
+#define MDNS_HOSTNAME       "matter-broker"
+#define MDNS_MQTT_SERVICE   "_mqtt"
+#define MDNS_MQTT_PROTO     "_tcp"
+#define MDNS_MQTT_PORT      1883
+
 /* ==================== 全局变量 ==================== */
 
 /* TuyaOpen IoT 客户端（全局，供 app_protocol_bridge_reset_tuya 访问） */
@@ -81,6 +94,9 @@ static volatile bool s_monitor_running = false;
 
 /* WiFi 连接状态 */
 static volatile bool s_wifi_connected = false;
+
+/* mDNS 初始化标志（确保仅初始化一次） */
+static bool s_mdns_initialized = false;
 
 /* ==================== KV Seed/Key 派生 ==================== */
 
@@ -106,6 +122,51 @@ static void derive_kv_from_mac(const NW_MAC_S *mac, char *seed, char *key, size_
     uint8_t xor_tail = m[2] ^ m[3] ^ m[4] ^ m[5];
     snprintf(key, buf_size, "br%02X%02X%02X%02X%02X%02X%02X",
              m[5], m[4], m[3], m[2], m[1], m[0], xor_tail);
+}
+
+/* ==================== mDNS 服务初始化 ==================== */
+
+/**
+ * @brief 初始化 mDNS 服务，注册 hostname 和 MQTT broker 服务
+ *
+ * 使 LoRa 网关可通过 matter-broker.local:1883 寻址 ESP32 上的 MQTT Broker，
+ * 与 Matter 方案统一，无需硬编码 IP 地址。
+ * 仅在 WiFi 连接成功后调用一次（由 TUYA_EVENT_DIRECT_MQTT_CONNECTED 触发）。
+ */
+static void setup_mdns_service(void)
+{
+    if (s_mdns_initialized) {
+        return;
+    }
+
+#if !defined(PLATFORM_UBUNTU) || (PLATFORM_UBUNTU == 0)
+    /* 初始化 mDNS（如果 SDK 已初始化，mdns_init 返回 ESP_ERR_INVALID_STATE，忽略即可） */
+    esp_err_t ret = mdns_init();
+    if (ret != ESP_OK) {
+        PR_DEBUG("mDNS init 返回 %d（可能已由 SDK 初始化，继续设置 hostname）", ret);
+    }
+
+    /* 设置主机名为 matter-broker */
+    ret = mdns_hostname_set(MDNS_HOSTNAME);
+    if (ret != ESP_OK) {
+        PR_WARN("mDNS 设置主机名失败: %d", ret);
+        return;
+    }
+
+    /* 注册 MQTT broker 服务，使网关可通过 _mqtt._tcp 服务发现 */
+    ret = mdns_service_add(NULL, MDNS_MQTT_SERVICE, MDNS_MQTT_PROTO,
+                           MDNS_MQTT_PORT, NULL, 0);
+    if (ret != ESP_OK) {
+        PR_WARN("mDNS 添加 MQTT 服务失败: %d", ret);
+    }
+
+    PR_INFO("mDNS 已启动: %s.local | %s.%s @ port %d",
+            MDNS_HOSTNAME, MDNS_MQTT_SERVICE, MDNS_MQTT_PROTO, MDNS_MQTT_PORT);
+    s_mdns_initialized = true;
+#else
+    PR_INFO("mDNS 在 Ubuntu 平台不可用，跳过");
+    s_mdns_initialized = true;
+#endif
 }
 
 /* ==================== 用户日志输出回调 ==================== */
@@ -165,6 +226,8 @@ void user_event_handler_on(tuya_iot_client_t *client, tuya_event_msg_t *event)
         s_wifi_connected = true;
         /* 蓝灯常亮：已连接涂鸦云 */
         app_led_set(LED_BLUE, LED_MODE_ON, 0);
+        /* 初始化 mDNS 服务（仅一次），使 LoRa 网关可通过 matter-broker.local 寻址 */
+        setup_mdns_service();
         /* 通知协议桥接层 WiFi 已连接，启动本地 MQTT 客户端 */
         app_protocol_bridge_on_wifi_connected();
         break;

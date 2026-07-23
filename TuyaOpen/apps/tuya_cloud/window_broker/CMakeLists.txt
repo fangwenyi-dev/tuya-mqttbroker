@@ -33,6 +33,8 @@ if(DEFINED IDF_PATH)
     list(APPEND APP_INC ${IDF_PATH}/components/esp-tls)
     list(APPEND APP_INC ${IDF_PATH}/components/esp_common/include)
     list(APPEND APP_INC ${IDF_PATH}/components/log/include)
+    # mDNS 头文件（matter-broker.local 局域网寻址）
+    list(APPEND APP_INC ${IDF_PATH}/components/mdns/include)
 endif()
 
 ########################################
